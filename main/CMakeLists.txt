@@ -1,0 +1,55 @@
+# Include secrets
+include(${CMAKE_SOURCE_DIR}/secrets.cmake OPTIONAL)
+
+# Define defaults if not set in secrets.cmake
+if(NOT DEFINED VAL_WIFI_SSID)
+    set(VAL_WIFI_SSID "XplaceholderWIFISSID____________")
+endif()
+if(NOT DEFINED VAL_WIFI_PASSWORD)
+    set(VAL_WIFI_PASSWORD "XplaceholderWIFIPASSWORD________________________________________")
+endif()
+if(NOT DEFINED VAL_REMOTE_URL)
+    set(VAL_REMOTE_URL "XplaceholderREMOTEURL___________________________________________________________________________________________________________")
+endif()
+
+# Conditionally include touch_control.c only for Tidbyt Gen2
+set(SRCS "main.c"
+         "display.cpp"
+         "flash.c"
+         "gfx.c"
+         "ota.c"
+         "remote.c"
+         "wifi.c"
+         "ap.c"
+         "nvs_settings.c"
+         "dns_wrapper.c"
+         "syslog.c"
+         "sntp.c")
+
+if(CONFIG_BOARD_TIDBYT_GEN2)
+    list(APPEND SRCS "touch_control.c")
+endif()
+
+idf_component_register(SRCS ${SRCS}
+                       INCLUDE_DIRS ".")
+
+idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=esp_getaddrinfo" APPEND)
+
+# Emit secrets as a generated header instead of compile definitions: CMake
+# silently drops any -D value containing '#' (e.g. in a WiFi password).
+foreach(_secret VAL_WIFI_SSID VAL_WIFI_PASSWORD VAL_REMOTE_URL)
+    string(REPLACE "\\" "\\\\" ${_secret} "${${_secret}}")
+    string(REPLACE "\"" "\\\"" ${_secret} "${${_secret}}")
+endforeach()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gen/secrets_gen.h"
+"// Auto-generated from secrets.cmake - DO NOT EDIT
+#pragma once
+#define WIFI_SSID \"${VAL_WIFI_SSID}\"
+#define WIFI_PASSWORD \"${VAL_WIFI_PASSWORD}\"
+#define REMOTE_URL \"${VAL_REMOTE_URL}\"
+")
+target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen")
+
+if(CONFIG_NO_FAST_FUNCTIONS)
+    idf_build_set_property(COMPILE_DEFINITIONS "-DNO_FAST_FUNCTIONS" APPEND)
+endif()
