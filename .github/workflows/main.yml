@@ -107,7 +107,7 @@ jobs:
           mv "$BUILD_DIR/merged_firmware.bin" "${target}_merged.bin"
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}_firmware
           path: |
