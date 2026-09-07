@@ -17,7 +17,11 @@
 
 static const char *TAG = "gfx";
 
+#if CONFIG_IDF_TARGET_ESP32S2
+#define GFX_TASK_CORE 0  // S2 is single-core; only core 0 exists.
+#else
 #define GFX_TASK_CORE 1
+#endif
 #define GFX_TASK_PRIO 2
 #define GFX_TASK_STACK_SIZE 4092
 
