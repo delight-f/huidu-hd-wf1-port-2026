@@ -1,138 +1,45 @@
-# Tronbyt Firmware
+# firmware-esp32 (Huidu HD-WF1 Branch — 2026)
 
-[![Discord Server](https://img.shields.io/discord/928484660785336380?style=flat-square)](https://discord.gg/U6h6CD6MYM)
+![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.5.2-blue?logo=espressif)
+![License](https://img.shields.io/github/license/tronbyt/firmware-esp32)
+![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
+![Year](https://img.shields.io/badge/year-2026-darkgreen)
 
-This repository contains a community supported firmware for the Tidbyt hardware 🤓.
+This branch adds experimental support for the **Huidu HD-WF1** 64×32 HUB75E LED matrix panel on an **ESP32-S2** (4MB flash, no PSRAM), alongside the existing ESP32-based boards.
 
-## Warning
+## ⚠️ Status
+**Hardware-untested.** All changes compile and pass `image_info`, but this firmware has **not** been flashed to or validated against real HD-WF1 hardware. Use at your own risk.
 
-⚠️ Warning! Flashing your Tidbyt with this firmware or derivatives could fatally
-damage your device. As such, flashing your Tidbyt with this firmware or
-derivatives voids your warranty and comes without support.
-
-## Getting Started
-
-Follow the setup instructions for [tronbyt-server][3] unless you want to build yourself with ESP-IDF.
-
-## Building yourself with ESP-IDF
-
-Only follow these instructions if you want to build the firmware yourself. Otherwise let the [tronbyt-server][3] generate the firmware file for you.
-This project uses the native [ESP-IDF][2] framework to build, flash, and monitor firmware.
-
-Additionally, this firmware is designed to work with https://github.com/tronbyt/server or
-you can point this firmware at any URL that hosts a WebP image that is optimized for the Tidbyt display.
-
-### Configuration
-
-To flash the custom firmware on your device, follow these steps:
-
-1. Copy `secrets.json.example` to `secrets.json`.
-2. Edit `secrets.json` with your information. If using tronbyt_manager in Docker, use the Docker host's IP address.
-
-Example `secrets.json`:
-```json
-{
-    "WIFI_SSID": "myssid",
-    "WIFI_PASSWORD": "<PASSWORD>",
-    "REMOTE_URL": "http://homeServer.local:8000/tronbyt_1/next",
-}
-```
-
-### Build and Flash
-
-Use the provided `Makefile` for convenience to build for specific hardware:
-
+## Build
 ```bash
-# For Tidbyt Gen 1
-make tidbyt-gen1
+export PATH=$HOME/.idf-venv/bin:$PATH
+. $HOME/esp-idf/export.sh
+cd $HOME/firmware-esp32
 
-# For Tidbyt Gen 2
-make tidbyt-gen2
-
-# For Tronbyt S3
-make tronbyt-s3
+# Target the HD-WF1 configuration specifically
+rm -f sdkconfig
+idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.huidu-wf1" set-target esp32s2
+idf.py build
 ```
 
-To flash the built firmware to your device:
+## New Files / Changes
+| File                       | Change                                                   |
+|----------------------------|----------------------------------------------------------|
+| `main/Kconfig.projbuild`   | Added `BOARD_HUIDU_WF1` choice block                     |
+| `main/display.cpp`         | Added pin map for HD-WF1 (GPIO 2–39 per datasheet)     |
+| `main/gfx.c`               | Core-pinning fix: `#if CONFIG_IDF_TARGET_ESP32S2` guard |
+| `sdkconfig.defaults.huidu-wf1` | New file — S2 target, SPIRAM disabled, panel pins      |
 
+## Flash (untested)
 ```bash
-idf.py flash
+esptool --chip esp32s2 --before no_reset --after hard_reset write_flash 0x0 build/merged_firmware.bin
 ```
+Bridge the two pads near the Micro-USB port on the WF1 to enter download mode, then connect via the USB-A port.
 
-#### Patched Variants (HUB75 I2S Divider Fix)
+## Notes
+- Single-core S2 fix for `xTaskCreatePinnedToCore`: `GFX_TASK_CORE` forced to `0`.
+- `CONFIG_SPIRAM=n` is set in defaults, but check `sdkconfig` after configure.
+- `swap_colors` excluded from `display.cpp` per original spec; revisit after bench test.
 
-Some Tidbyt Gen1/Gen2 panels show red pixel artifacts at the default pixel clock because the bundled ESP32-HUB75-MatrixPanel-DMA library snaps the clock to 20MHz/10MHz instead of honoring the requested frequency (see [mrcodetastic/ESP32-HUB75-MatrixPanel-DMA#816](https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA/issues/816)). The legacy Tidbyt OS used a divider derived from the requested frequency; the `-patched` targets restore that behavior by enabling `CONFIG_PATCH_I2S_DIVIDER`, which patches the downloaded library at configure time (and reverts it when disabled):
-
-```bash
-make tidbyt-gen1-patched
-make tidbyt-gen1_swap-patched
-make tidbyt-gen2-patched
-```
-
-If your panel looks fine with the regular targets, you don't need these.
-
-## Monitoring Logs
-
-To check the output of your running firmware, run the following:
-
-```bash
-idf.py monitor
-```
-
-## Advanced Settings
-
-The firmware supports several advanced settings stored in Non-Volatile Storage (NVS). These can be configured via the WebSocket connection or by using `idf.py menuconfig` (which sets the build-time defaults).
-
-| Setting | NVS Key | Description |
-| :--- | :--- | :--- |
-| **Hostname** | `hostname` | The network hostname of the device. Defaults to `tronbyt-<mac>`. |
-| **Syslog Address** | `syslog_addr` | Remote Syslog (RFC 5424) server in `host:port` format (e.g., `192.168.1.10:1517`). |
-| **SNTP Server** | `sntp_server` | Custom NTP server for time synchronization. Defaults to DHCP provided servers or `pool.ntp.org`. |
-| **Swap Colors** | `swap_colors` | Boolean (0/1) to swap RGB color order. Useful for specific panel variants. |
-| **AP Mode** | `ap_mode` | Boolean (0/1) to enable/disable the fallback WiFi configuration portal. |
-| **WiFi Power Save**| `wifi_ps` | WiFi power management mode (0: None, 1: Min, 2: Max). |
-| **Prefer IPv6** | `prefer_ipv6` | Boolean (0/1) to prefer IPv6 connectivity over IPv4. |
-
-## Back to Normal
-
-### Using Web Flasher (Recommended)
-
-The easiest way to restore your Tidbyt to factory firmware is using the web flasher with the pre-built merged binary files:
-
-1. Download the appropriate merged binary file:
-   - **Gen 1**: [gen1_merged.bin](https://github.com/tronbyt/firmware-esp32/raw/main/reset/gen1_merged.bin)
-   - **Gen 2**: [gen2_merged.bin](https://github.com/tronbyt/firmware-esp32/raw/main/reset/gen2_merged.bin)
-2. Visit [https://espressif.github.io/esptool-js/](https://espressif.github.io/esptool-js/) (requires Chrome or Edge browser)
-3. Connect your Tidbyt via USB
-4. Use the following settings:
-   - **Flash Address**: `0x0`
-   - **File**: Select the downloaded merged binary file
-
-![Web Flasher Settings](docs/assets/web_flasher_settings.png)
-
-4. Click "Program" to flash the factory firmware
-
-### Using the WiFi config portal
-
-The firmware has a rudimentary wifi config portal page that can be accessed by joining the TRONBYT-CONFIG network and navigating to http://10.10.0.1. 
-
-[WiFi Config Portal How-To Video](https://www.youtube.com/watch?v=OAWUCG-HRDs)
-
-## Troubleshooting
-
-### OTA Update Fails with "Validation Failed" or "Checksum Error"
-
-If you are seeing errors like `ESP_ERR_OTA_VALIDATE_FAILED` or checksum mismatches in the logs, especially on Gen 1 devices previously used with ESPHome or stock firmware:
-
-1.  **Partition Table Mismatch:** You likely have an old or incompatible partition table on your device. This happens if you flashed only the `firmware.bin` instead of the full `merged.bin` during the initial install.
-
-2.  **Solution:** You must perform a **clean install**.
-
-    *   Use the **Web Flasher** method described in "Back to Normal.
-    *   Ensure you select the **merged binary** (`gen1_merged.bin`).
-    *   Ideally, use the "Erase Flash" option in the flasher tool before programming to ensure a clean slate.
-
-
-[1]: https://github.com/tidbyt/pixlet
-[2]: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html
-[3]: https://github.com/tronbyt/server
+## Upstream
+This branch is intended for submission as a PR to [tronbyt/firmware-esp32](https://github.com/tronbyt/firmware-esp32).

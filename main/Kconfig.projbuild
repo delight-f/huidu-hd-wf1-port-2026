@@ -161,6 +161,9 @@ menu "Application Configuration"
         config BOARD_TIDBYT_GEN2
             bool "Tidbyt Gen 2"
 
+        config BOARD_HUIDU_WF1
+            bool "Huidu HD-WF1"
+
         config BOARD_TRONBYT_S3
             bool "Tronbyt S3"
 

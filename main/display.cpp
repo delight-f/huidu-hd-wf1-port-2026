@@ -132,6 +132,23 @@
 #define CLK 2
 #define LAT 47
 #define OE 14
+#elif CONFIG_BOARD_HUIDU_WF1
+#define R1 2
+#define G1 6
+#define BL1 3
+#define R2 4
+#define G2 8
+#define BL2 5
+
+#define CH_A 39
+#define CH_B 38
+#define CH_C 37
+#define CH_D 36
+#define CH_E 12
+
+#define LAT 33
+#define OE 35
+#define CLK 34
 #else  // GEN1 from here down.
 #define R1 2
 #define G1 22
