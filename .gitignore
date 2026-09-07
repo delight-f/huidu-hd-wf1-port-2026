@@ -8,6 +8,8 @@ _secrets.json.injected
 .vscode/*
 build
 dependencies.lock
+__pycache__/
+*.pyc
 eim_config.toml
 managed_components
 sdkconfig
