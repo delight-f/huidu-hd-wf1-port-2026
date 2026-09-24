@@ -1,9 +1,12 @@
 #include "display.h"
 
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <nvs.h>
+#include <stdio.h>
 
 #include "font5x7.h"
 #include "nvs_settings.h"
@@ -218,11 +221,13 @@ static const char *TAG = "display";
 #define PANEL_SPEED_DEF 1  /* 20 MHz */
 #define PANEL_LATCH_DEF 1
 #define PANEL_DBUFF_DEF 0
+#define PANEL_LINE_DEF 0 /* TYPE138 */
 #else
 #define PANEL_DRIVER_DEF 2 /* FM6126A */
 #define PANEL_SPEED_DEF 0  /* 8 MHz */
 #define PANEL_LATCH_DEF 1
 #define PANEL_DBUFF_DEF 1
+#define PANEL_LINE_DEF 0 /* TYPE138 */
 #endif
 
 #if CONFIG_NO_INVERT_CLOCK_PHASE
@@ -282,8 +287,12 @@ int display_initialize(void) {
   int latch = panel_cfg_get("panel_lat", PANEL_LATCH_DEF);
   int ph = panel_cfg_get("panel_ph", PANEL_PHASE_DEF);
   int dbfr = panel_cfg_get("panel_dbfr", PANEL_DBUFF_DEF);
+  int line = panel_cfg_get("panel_line", PANEL_LINE_DEF);
   if (drv < 0 || drv > 5) {
     drv = PANEL_DRIVER_DEF;
+  }
+  if (line < 0 || line > 3) {
+    line = PANEL_LINE_DEF;
   }
   if (latch < 1) {
     latch = 1;
@@ -292,14 +301,14 @@ int display_initialize(void) {
     latch = 8;
   }
   ESP_LOGI(TAG,
-           "Panel config: driver=%d speed=%d latch_blanking=%d phase=%d "
+           "Panel config: driver=%d line=%d speed=%d latch_blanking=%d phase=%d "
            "double_buff=%d",
-           drv, spd, latch, ph, dbfr);
+           drv, line, spd, latch, ph, dbfr);
 
   HUB75_I2S_CFG mxconfig(
       WIDTH, HEIGHT, 1, pins,
       (HUB75_I2S_CFG::shift_driver)drv,  // driver chip
-      HUB75_I2S_CFG::TYPE138,            // line driver
+      (HUB75_I2S_CFG::line_driver)line,  // row decoder
       dbfr != 0,                         // double-buffering
       spd ? HUB75_I2S_CFG::HZ_20M : HUB75_I2S_CFG::HZ_10M,  // clock speed
       (uint8_t)latch,                                        // latch blanking
@@ -328,8 +337,20 @@ int display_initialize(void) {
   vTaskDelay(pdMS_TO_TICKS(500));
   _matrix->fillScreenRGB888(0, 0, 255);
   vTaskDelay(pdMS_TO_TICKS(500));
-  panel_sweep_indicator();
-  vTaskDelay(pdMS_TO_TICKS(1500));
+
+  // TEMP BENCH DIAGNOSTIC: print the boot numbers on the panel. Text renders
+  // correctly even when the WebP path does not, so this is the reliable way to
+  // read state on a board with no usable console.
+  char d1[16], d2[16], d3[16], d4[16];
+  snprintf(d1, sizeof(d1), "heap %uk",
+           (unsigned)(esp_get_free_heap_size() / 1024));
+  snprintf(d2, sizeof(d2), "int %uk",
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+  snprintf(d3, sizeof(d3), "dma %uk",
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024));
+  snprintf(d4, sizeof(d4), "cfg %d %d %d", drv, line, latch);
+  display_diag_show(d1, d2, d3, d4);
+  vTaskDelay(pdMS_TO_TICKS(5000));
   _matrix->clearScreen();
 #endif
 
@@ -440,6 +461,40 @@ void display_clear(void) {
   if (_matrix != NULL) {
     _matrix->clearScreen();
   }
+}
+
+// Uses the library's own full-screen fill rather than per-pixel writes: a
+// uniform fill is the one thing that renders correctly on this board even when
+// the scan path is mis-configured, so it is the reliable boot indicator.
+void display_fill_screen(uint8_t r, uint8_t g, uint8_t b) {
+  if (_matrix != NULL) {
+    _matrix->fillScreenRGB888(r, g, b);
+  }
+}
+
+void display_diag_show(const char *l1, const char *l2, const char *l3,
+                       const char *l4) {
+  if (_matrix == NULL) {
+    return;
+  }
+  _matrix->clearScreen();
+
+  const char *lines[4] = {l1, l2, l3, l4};
+  for (int i = 0; i < 4; i++) {
+    if (lines[i] == NULL) {
+      continue;
+    }
+    // 64 px wide, 6 px per glyph: 10 characters per line.
+    char buf[11];
+    size_t n = strlen(lines[i]);
+    if (n > 10) {
+      n = 10;
+    }
+    memcpy(buf, lines[i], n);
+    buf[n] = '\0';
+    display_text(buf, 0, i * 8, 255, 255, 255, 1);
+  }
+  display_flip();
 }
 
 void display_draw_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {

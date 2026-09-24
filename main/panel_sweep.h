@@ -26,6 +26,10 @@ void panel_sweep_indicator(void);
 // Active configuration index (0 = board defaults).
 int panel_sweep_index(void);
 
+// Raw GPIO levels of the candidate button pins, for bench diagnosis via /diag.
+int panel_sweep_button_level(void);  // CONFIG_BUTTON_PIN (GPIO11 on the WF1)
+int panel_sweep_gpio0_level(void);   // GPIO0
+
 #ifdef __cplusplus
 }
 #endif

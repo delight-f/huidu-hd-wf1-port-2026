@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define DIAG_LOG_CAP 4096
+#define DIAG_LOG_CAP 1024
 
 static char s_log[DIAG_LOG_CAP];
 static size_t s_len = 0;

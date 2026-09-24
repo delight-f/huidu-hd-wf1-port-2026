@@ -9,6 +9,7 @@
 #include <esp_wifi.h>
 #include <lwip/sockets.h>
 #include <nvs.h>
+#include <sdkconfig.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,7 @@
 #include "diag.h"
 #include "mem_compat.h"
 #include "nvs_settings.h"
+#include "panel_sweep.h"
 #include "wifi.h"
 
 #define TAG "AP"
@@ -320,17 +322,19 @@ static void stop_dns_server(void) {
 }
 
 static esp_err_t diag_handler(httpd_req_t *req) {
-  char hdr[320];
+  char hdr[384];
   int hdr_len = snprintf(
       hdr, sizeof(hdr),
       "reset_reason=%d\nfree_heap=%u\nfree_internal=%u\nlargest_internal=%u\n"
-      "free_dma=%u\nlargest_dma=%u\nbrightness=%u\n--- captured log ---\n",
+      "free_dma=%u\nlargest_dma=%u\nbrightness=%u\nbtn_gpio%d=%d\n"
+      "btn_gpio0=%d\n--- captured log ---\n",
       (int)esp_reset_reason(), (unsigned)esp_get_free_heap_size(),
       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
-      (unsigned)nvs_get_brightness());
+      (unsigned)nvs_get_brightness(), (int)CONFIG_BUTTON_PIN,
+      panel_sweep_button_level(), panel_sweep_gpio0_level());
 
   httpd_resp_set_type(req, "text/plain");
   httpd_resp_send_chunk(req, hdr, hdr_len);
@@ -360,7 +364,8 @@ static esp_err_t panel_handler(httpd_req_t *req) {
                 {"spd", "panel_spd"},
                 {"lat", "panel_lat"},
                 {"ph", "panel_ph"},
-                {"dbfr", "panel_dbfr"}};
+                {"dbfr", "panel_dbfr"},
+                {"line", "panel_line"}};
 
   char query[128] = {0};
   bool have_query = httpd_req_get_url_query_len(req) > 0 &&

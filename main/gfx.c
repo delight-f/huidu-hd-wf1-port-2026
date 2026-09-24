@@ -1,12 +1,16 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_system.h>
 #include <esp_websocket_client.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <http_parser.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <webp/decode.h>
 #include <webp/demux.h>
 
 #include "assets.h"
@@ -63,6 +67,20 @@ static void display_text_fitted(const char *text, int x, int y, uint8_t r,
   memcpy(buf, text, n);
   buf[n] = '\0';
   display_text(buf, x, y, r, g, b, 1);
+}
+
+// TEMP BENCH DIAGNOSTIC: render decode state on the panel. The text renderer
+// works even when the WebP path does not, so this is how we read state on a
+// board with no usable console. `tag` names the stage, `ok` the outcome.
+static void diag_panel(const char *tag, size_t len, bool ok) {
+  char a[16], b[16], c[16], d[16];
+  snprintf(a, sizeof(a), "stk %u",
+           (unsigned)uxTaskGetStackHighWaterMark(NULL));
+  snprintf(b, sizeof(b), "webp %u", (unsigned)len);
+  snprintf(c, sizeof(c), "%s %s", tag, ok ? "OK" : "ERR");
+  snprintf(d, sizeof(d), "heap %uk",
+           (unsigned)(esp_get_free_heap_size() / 1024));
+  display_diag_show(a, b, c, d);
 }
 
 int gfx_initialize(const char *img_url) {
@@ -446,6 +464,8 @@ static void gfx_loop(void *args) {
       if (draw_webp(webp, len, dwell_secs, &isAnimating)) {
         ESP_LOGE(TAG, "Could not draw webp");
         draw_error_indicator_pixel();
+        // draw_webp() already left its stage ("new"/"info") on the panel; do not
+        // overwrite it here or we lose which stage failed.
         vTaskDelay(pdMS_TO_TICKS(1 * 1000));
         isAnimating = 0;
         // Free the invalid buffer to prevent re-drawing it
@@ -460,101 +480,110 @@ static void gfx_loop(void *args) {
   }
 }
 
+// Reusable decode target.
+//
+// WebPAnimDecoder allocates two full canvas buffers internally
+// (curr_frame and prev_frame_disposed, 2 x w*h*3 bytes) plus the VP8 decoder
+// state. On this board that allocation fails outright ("new ERR" on the panel):
+// the ESP32-S2 has only ~172 KB of data RAM in total and ~24 KB free here.
+// Decoding each frame into a single buffer we own - allocated once, before the
+// heap fragments - needs ~6 KB for a 64x32 frame and fits comfortably. This is
+// the same approach libwebp's own anim decoder uses per frame
+// (anim_decode.c: WebPDecode(fragment, size, config) with external memory),
+// minus its canvas bookkeeping.
+static uint8_t *s_dec_buf = NULL;
+static size_t s_dec_buf_size = 0;
+
+static uint8_t *decode_buffer(size_t need) {
+  if (s_dec_buf != NULL && s_dec_buf_size >= need) {
+    return s_dec_buf;
+  }
+  if (s_dec_buf != NULL) {
+    free(s_dec_buf);
+    s_dec_buf = NULL;
+    s_dec_buf_size = 0;
+  }
+  s_dec_buf = (uint8_t *)malloc(need);
+  if (s_dec_buf != NULL) {
+    s_dec_buf_size = need;
+  }
+  return s_dec_buf;
+}
+
 static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
                      volatile int32_t *isAnimating) {
-  // Set up WebP decoder
-  // ESP_LOGI(TAG, "starting draw_webp");
-  int app_dwell_secs = dwell_secs;
+  int64_t dwell_us = (int64_t)(dwell_secs <= 0 ? 1 : dwell_secs) * 1000000;
 
-  int64_t dwell_us;
-
-  if (app_dwell_secs <= 0) {
-    ESP_LOGW(TAG, "dwell_secs is 0. Looping one more time while we wait.");
-    dwell_us = 1 * 1000000;  // default to 1s if it's zero so we loop again or
-                             // show the image for 1 more second.
-  } else {
-    // ESP_LOGI(TAG, "dwell_secs : %d", app_dwell_secs);
-    dwell_us = app_dwell_secs * 1000000;
+  int w = 0, h = 0;
+  if (!WebPGetInfo(buf, len, &w, &h) || w <= 0 || h <= 0) {
+    ESP_LOGE(TAG, "WebPGetInfo failed");
+    draw_error_indicator_pixel();
+    diag_panel("info", len, false);
+    return 1;
   }
-  // ESP_LOGI(TAG, "frame count: %d", animation.frame_count);
+
+  const size_t need = (size_t)w * (size_t)h * 3;
+  uint8_t *out = decode_buffer(need);
+  if (out == NULL) {
+    ESP_LOGE(TAG, "decode buffer alloc failed (%u bytes)", (unsigned)need);
+    draw_error_indicator_pixel();
+    diag_panel("buf", len, false);
+    return 1;
+  }
 
   WebPData webpData;
   WebPDataInit(&webpData);
   webpData.bytes = buf;
   webpData.size = len;
 
-  WebPAnimDecoderOptions decoderOptions;
-  WebPAnimDecoderOptionsInit(&decoderOptions);
-  decoderOptions.color_mode = MODE_RGBA;
-
-  WebPAnimDecoder *decoder = WebPAnimDecoderNew(&webpData, &decoderOptions);
-  if (decoder == NULL) {
-    ESP_LOGE(TAG, "Could not create WebP decoder");
+  WebPDemuxer *demux = WebPDemux(&webpData);
+  if (demux == NULL) {
+    ESP_LOGE(TAG, "WebPDemux failed");
     draw_error_indicator_pixel();
+    diag_panel("dmux", len, false);
     return 1;
   }
 
-  WebPAnimInfo animation;
-  if (!WebPAnimDecoderGetInfo(decoder, &animation)) {
-    ESP_LOGE(TAG, "Could not get WebP animation");
-    draw_error_indicator_pixel();
-    WebPAnimDecoderDelete(decoder);  // Clean up decoder before returning
-    return 1;
-  }
-  // ESP_LOGI(TAG, "frame count: %d", animation.frame_count);
-  int64_t start_us = esp_timer_get_time();
-
-  while (esp_timer_get_time() - start_us < dwell_us && *isAnimating != -1 && !_state->paused) {
-    int lastTimestamp = 0;
-    int delay = 0;
-    TickType_t drawStartTick = xTaskGetTickCount();
-
-    // Draw each frame, and sleep for the delay
-    while (WebPAnimDecoderHasMoreFrames(decoder) && *isAnimating != -1 && !_state->paused) {
-      uint8_t *pix;
-      int timestamp;
-      WebPAnimDecoderGetNext(decoder, &pix, &timestamp);
-      if (delay > 0) {
-        xTaskDelayUntil(&drawStartTick, pdMS_TO_TICKS(delay));
-      } else {
-        vTaskDelay(10);  // small delay for yield.
-      }
-      drawStartTick = xTaskGetTickCount();
-      display_draw(pix, animation.canvas_width, animation.canvas_height, 4, 0,
-                   1, 2);
-      delay = timestamp - lastTimestamp;
-      lastTimestamp = timestamp;
-    }
-
-    // reset decoder to start from the beginning
-    WebPAnimDecoderReset(decoder);
-
-    if (delay > 0) {
-      xTaskDelayUntil(&drawStartTick, pdMS_TO_TICKS(delay));
-    } else {
-      vTaskDelay(
-          pdMS_TO_TICKS(100));  // Add a small fallback delay to yield CPU
-    }
-
-    // In case of a single frame, sleep for app_dwell_secs
-    if (animation.frame_count == 1) {
-      // For static images, we need to check isAnimating periodically during the
-      // dwell time Break the dwell time into 100ms chunks so we can respond to
-      // immediate commands
-      int64_t static_start_us = esp_timer_get_time();
-      while (esp_timer_get_time() - static_start_us < dwell_us) {
-        if (*isAnimating == -1 || _state->paused) {
-          // Immediate command received, break out of dwell time
-          break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));  // Check every 100ms
-      }
+  const int64_t start_us = esp_timer_get_time();
+  while (esp_timer_get_time() - start_us < dwell_us && *isAnimating != -1 &&
+         !_state->paused) {
+    WebPIterator iter;
+    if (!WebPDemuxGetFrame(demux, 1, &iter)) {
       break;
     }
-  }
-  WebPAnimDecoderDelete(decoder);
 
-  // ESP_LOGI(TAG, "Setting isAnimating to 0");
+    do {
+      WebPDecoderConfig cfg;
+      if (!WebPInitDecoderConfig(&cfg)) {
+        diag_panel("cfg", len, false);
+        break;
+      }
+      cfg.output.colorspace = MODE_RGB;
+      cfg.output.is_external_memory = 1;
+      cfg.output.u.RGBA.rgba = out;
+      cfg.output.u.RGBA.stride = w * 3;
+      cfg.output.u.RGBA.size = need;
+      cfg.options.no_fancy_upsampling = 1;
+
+      if (WebPDecode(iter.fragment.bytes, iter.fragment.size, &cfg) ==
+          VP8_STATUS_OK) {
+        display_draw(out, w, h, 3, 0, 1, 2);
+        diag_panel("dec", len, true);
+      } else {
+        diag_panel("dec1", len, false);
+      }
+      WebPFreeDecBuffer(&cfg.output);
+
+      vTaskDelay(pdMS_TO_TICKS(iter.duration ? iter.duration : 100));
+    } while (WebPDemuxNextFrame(&iter) && *isAnimating != -1 &&
+             !_state->paused &&
+             esp_timer_get_time() - start_us < dwell_us);
+
+    WebPDemuxReleaseIterator(&iter);
+  }
+
+  WebPDemuxDelete(demux);
+
   if (*isAnimating != -1) {
     *isAnimating = 0;
   }

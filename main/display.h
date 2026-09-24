@@ -18,6 +18,13 @@ void display_draw(const uint8_t* pix, int width, int height, int channels,
                   int ixR, int ixG, int ixB);
 
 void display_clear(void);
+void display_fill_screen(uint8_t r, uint8_t g, uint8_t b);
+
+// Temporary bench diagnostic: clear the panel and print up to four short
+// (<=10 char) lines with the text renderer, which works even when the WebP
+// decode path does not. Used because this board has no usable serial console.
+void display_diag_show(const char *l1, const char *l2, const char *l3,
+                       const char *l4);
 void display_draw_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b);
 void display_fill_rect(int x, int y, int w, int h, uint8_t r, uint8_t g,
                        uint8_t b);
