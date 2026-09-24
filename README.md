@@ -11,7 +11,7 @@
 Tronbyt/WebP LED-matrix firmware ([tronbyt/firmware-esp32](https://github.com/tronbyt/firmware-esp32)) ported to the **Huidu HD-WF1** — an **ESP32-S2** (single-core, 4 MB flash, no PSRAM) driving a **64×32 HUB75E** panel. It fetches WebP images from a URL or over a WebSocket, with a WiFi captive portal for setup.
 
 > [!IMPORTANT]
-> **Bottom line after bench bring-up: the firmware runs, the display works, but WebP images do not.** The panel, its timing and its colour order are all demonstrably correct — the boot version screen is legible and solid R/G/B fills are the right colours. What fails is the **WebP decoder**, which cannot fit inside this chip's memory budget. The remaining work is memory-shaped, not display-config-shaped. See [Bring-up status](#bring-up-status) and [Work left to do](#work-left-to-do).
+> **Bottom line after bench bring-up: the firmware runs, the display works, and the device talks to the Tronbyt server — but WebP images do not render yet.** The panel, its timing and its colour order are all demonstrably correct, and the network path is now confirmed end to end (the log shows real image fetches from the Tronbyt server returning in 26–75 ms). What fails is the **WebP decoder**, and it fails on a single allocation: libwebp needs one *contiguous* 12,544-byte block for its ARGB working buffer, and the largest free block the board can offer is 7,936–9,216 bytes. That is a **heap fragmentation** problem, not a capacity problem — ~20 KB is free, and ~18 KB is all the decoder needs. See [Bring-up status](#bring-up-status) and [Work left to do](#work-left-to-do).
 
 ## Hardware
 
@@ -76,12 +76,15 @@ Verified on real hardware (ESP32-S2 rev v1.0, no embedded PSRAM):
 | Build + flash (native ESP-IDF v5.5, esp32s2) | ✅ works |
 | Boots, single-core task pinning | ✅ works |
 | WiFi **station** join, DHCP | ✅ works |
-| Reaches the Tronbyt server and registers (visible in tronbyt-manager) | ✅ works |
+| **HTTP fetch from the Tronbyt server** | ✅ works — 226–360 byte images in 26–75 ms |
+| WebSocket connect / registration in tronbyt-manager | ⚠️ unverified (see note) |
 | Boot animation + version screen drawn on the panel | ✅ works (colours and blanking correct) |
-| Config portal, `/diag`, `/panel` | ✅ works |
-| **WebP image rendering** | ❌ **libwebp cannot decode in this chip's RAM** |
+| Config portal, `/diag`, `/panel` | ✅ works, over both the AP and the station address |
+| **WebP decode + rendering** | ❌ **one contiguous 12,544 B allocation fails — heap fragmentation** |
 
 Colour channel order and blanking are correct — a full-screen solid fill renders as the right colour, and the boot version text is legible. The failure is confined to the WebP decode path. See [Work left to do](#work-left-to-do).
+
+> **Note on "last seen".** The tronbyt-manager UI reports this device as offline even while `remote: Content-Length Header : 226` / `main: HTTP fetch returned in 26 ms` lines stream in the on-device log. The UI appears to track the **WebSocket**, not the HTTP polling that actually drives the display, so treat its "last seen" as a WebSocket health indicator rather than a connectivity test.
 
 ## Bring-up findings
 
@@ -128,13 +131,33 @@ The reference demo runs its panel as a plain shift-register type, and this port 
 
 **Fix:** `FM6124` is now the WF1 default driver (and `fm6124init()` does run — confirmed on the bench). This changed the output but did not solve the corruption.
 
-### 6. The real blocker: libwebp cannot decode in the RAM this chip has
+### 6. The real blocker: one contiguous allocation libwebp can never get
 
-Text and solid fills render correctly, which proves the panel, its timing and its colour order are all fine. What fails is the **WebP decoder** — the one component every other Tronbyt target has PSRAM to absorb.
+Text and solid fills render correctly, which proves the panel, its timing and its colour order are all fine. The network path is fine too — the log shows real fetches from the Tronbyt server. What fails is a **single allocation inside the WebP decoder**, and it fails on the *first frame* of every image, however small.
 
-`idf.py size` shows the ESP32-S2 has only **~172 KB of data-capable RAM in total** (~90 KB of which is IRAM-resident code), leaving ~26 KB of heap after WiFi. `WebPAnimDecoder` allocates **two full canvas buffers** internally (`anim_decode.c:140-145`) plus VP8 decoder state; that cannot be satisfied from ~24 KB of fragmented heap, so `WebPAnimDecoderNew()` returned NULL — reported on the panel as `new ERR`.
+`WebPAnimDecoder` was the first casualty: it allocates **two full canvas buffers** internally (`anim_decode.c:140-145`) plus VP8 state, and `WebPAnimDecoderNew()` returned NULL — reported on the panel as `new ERR`. `gfx.c` therefore stopped using it and drives the demuxer directly (`WebPDemux` + per-frame `WebPDecode` with `output.is_external_memory = 1`), which gets past the allocation it controls.
 
-`gfx.c` therefore no longer uses it. It now does `WebPGetInfo` → one reusable buffer we own (`decode_buffer()`, ~6 KB for 64×32 RGB) → `WebPDemux` → `WebPDecode` per frame with `output.is_external_memory = 1`. That gets past allocation but currently fails at the per-frame decode step (`dec1 ERR`); the handoff documents the exact divergence from libwebp's own frame decoder and what to try next.
+**That decode logic is now correct and verified.** Each animation frame is decoded at its own offset with the canvas stride and frame-height size, and multi-frame images are composited through an RGBA scratch using libwebp's own key-frame / blend / dispose rules. Rendered on the host against the vendored sources, the output is **byte-identical to `WebPAnimDecoder`'s** for still and animated assets (the only divergence is the deliberate `no_fancy_upsampling` choice, on lossy frames).
+
+What remains is purely the memory the decoder needs *internally*, which no option can shrink. On a 64×32 frame it wants **~18–26 KB transient**, as two allocations that are live at once:
+
+| Allocation | Size | Note |
+| ---------- | ---- | ---- |
+| `dec->pixels` (ARGB working buffer) | **12,544 B** | must be **contiguous** |
+| Huffman tables / htree groups | ~5–12 KB | data-dependent |
+
+Cropping does not help (it is applied on output only; measured peak unchanged) and scaling makes it *worse* (18,200 → 19,456 B), because the rescaler adds memory without shrinking the full-size pixel buffer.
+
+So the requirement reduces to: **one free block of ≥ 12,544 bytes, plus ~6 KB more from anywhere.** The board reports:
+
+```
+free_internal  19,924 B
+largest_internal 7,936 B      <-- must be >= 12,544
+```
+
+~20 KB is free — enough in total — but the largest usable run is under 8 KB. Hence `Could not draw webp` / `frame 1 decode failed`, every time, with a completely stable heap (no leak; verified flat across repeated samples).
+
+That makes this a **fragmentation** problem rather than a capacity one, which is a much better place to be: capacity cannot be conjured, but the layout can be influenced. See [Work left to do](#work-left-to-do).
 
 ### Tooling note: there is no usable serial console on this board
 
@@ -207,17 +230,21 @@ The active index, name and parameters are also logged and shown on `/diag` as
 
 ## Work left to do
 
-1. **Make libwebp decode within the available RAM** — the sole remaining blocker. The low-memory path is in place (`WebPDemux` + `WebPDecode` into our own buffer) and currently fails per frame (`dec1 ERR`). Ranked next steps, with exact source pointers, are in [HANDOFF.md](HANDOFF.md#5-the-open-problem-and-exactly-where-to-look-next):
-   - mirror libwebp's own frame decode exactly — per-frame **offset** into the canvas, **canvas stride**, **frame-height** size, and RGBA (4 channels) rather than the RGB this port switched to;
-   - keep a persistent canvas if partial frames or `blend_method` compositing turn out to matter;
-   - only if that fails, free more RAM (lower HTTP buffers, disable lwIP IPv6) and retry `WebPAnimDecoder`.
-2. **Find the device's IP / regain portal access** for tuning — the station link hides the board from the AP's subnet; a phone on `TRON-CONFIG` or the router's DHCP list is the easiest route. Consider adding the board's own IP to the boot screen.
-3. **Remove the temporary bench diagnostic** (`main/display.cpp`: the R/G/B fill after `begin()`), or gate it behind a Kconfig option.
-4. **Decide the AP auto-shutdown behaviour** — it is currently disabled so `/diag` stays reachable; upstream shuts the AP down ~2 minutes after STA connects (and switches to STA-only, which leaves the board unreachable if the station link then drops).
-5. **CI + IDE**: add a `huidu-wf1` entry to the GitHub Actions matrix (and an `esp32s2` case in its chip dispatch, which currently maps everything non-S3 to `esp32`), and to `esp_idf_project_configuration.json`.
-6. **OTA** — currently impossible: `boards/max_app_4mb.csv` has a single `factory` app slot. Two ~1.75 MB slots would fit in 4 MB (the app is ~1.3 MB).
-7. **Brightness ceiling** for third-party panels (`BRIGHTNESS_8BIT_MAX`) — the WF1 currently inherits the legacy `230`.
-8. **`swap_colors`** — still excluded for the WF1; revisit if the colours ever come out wrong.
+1. **Get one contiguous 12,544-byte free block** — the sole remaining blocker, and a heap-layout problem rather than a capacity one (see [finding 6](#6-the-real-blocker-one-contiguous-allocation-libwebp-can-never-get)). Everything else on the image path is done and verified. Ranked levers, cheapest and safest first — full detail and the reasoning for each is in [HANDOFF.md](HANDOFF.md):
+   - **Move our own buffers out of the middle of the heap.** `gfx.c` allocates its 6 KB canvas in the first `draw_webp()`, which is *after* WiFi, the HTTP server and the task stacks have come up — so it lands mid-heap and may be splitting the largest free run. Allocating it before the network stack starts costs nothing and could recover most of the missing contiguity.
+   - **Measure the heap's shape, don't infer it.** Add a free-block dump (`heap_caps_print_heap_info`) reachable from `/diag`. Three earlier fixes were aimed from totals instead of from the layout, and all three missed.
+   - **Retire the config portal's SoftAP once the station is up** (upstream already does this). It costs radio buffers, a DHCP server and a 4 KB DNS task stack. The station link works, so `/diag` stays reachable on the station address even without the AP. Keep the web server itself running.
+   - **Force a contiguous arena** if the layout turns out to be immovable: allocate a block early and release it immediately before `WebPDecode`, so libwebp's allocations land in a known-good run. Costs heap while held, so it needs care.
+2. **Do not re-chase these** — each was tried on the bench and measured, and none helped:
+   - trimming the WiFi buffer counts (`STATIC_TX/RX_BUFFER_NUM`, `MGMT_SBUF_NUM`, AMPDU) — moved the heap by noise only, so those buffers evidently are not in the measured region;
+   - moving the WiFi code out of IRAM (`CONFIG_ESP_WIFI_IRAM_OPT=n`) — frees ~23 KB of DIRAM at link time but made the *runtime* heap worse (24,948 → 20,368 B free);
+   - lowering the panel's BCM colour depth 8 → 5 to reclaim 6 KB — `free_internal` did not move at all;
+   - decoder cropping and scaling options — see finding 6.
+3. **Remove the temporary bench diagnostic** (`main/display.cpp`: the R/G/B fill after `begin()`), or gate it behind a Kconfig option. Note the panel comes up showing collapsed rows **immediately after a flash** and a power-cycle clears it — that is a post-flash transient, not a firmware fault, and it reproduces on stock config.
+4. **CI + IDE**: add a `huidu-wf1` entry to the GitHub Actions matrix (and an `esp32s2` case in its chip dispatch, which currently maps everything non-S3 to `esp32`), and to `esp_idf_project_configuration.json`.
+5. **OTA** — currently impossible: `boards/max_app_4mb.csv` has a single `factory` app slot. Two ~1.75 MB slots would fit in 4 MB (the app is ~1.3 MB).
+6. **Brightness ceiling** for third-party panels (`BRIGHTNESS_8BIT_MAX`) — the WF1 currently inherits the legacy `230`.
+7. **`swap_colors`** — still excluded for the WF1; revisit if the colours ever come out wrong.
 
 ## Changed files vs upstream
 
@@ -225,7 +252,7 @@ The active index, name and parameters are also logged and shown on `/diag` as
 | ---- | ------ |
 | `main/Kconfig.projbuild` | `BOARD_HUIDU_WF1` choice |
 | `main/display.cpp` | WF1 HUB75 pin map; per-board + runtime-tunable panel driver/timing; NULL-`_matrix` guards; text clamped to panel width; temporary R/G/B bench test |
-| `main/gfx.c` | S2 single-core guard; boot-debug text clamped to 10 chars so it fits 64 px |
+| `main/gfx.c` | S2 single-core guard; per-frame WebP decode at each frame's own offset with libwebp's key-frame/blend/dispose compositing; optional RGBA scratch, only taken when the heap can afford it; boot asset decoded in place from flash instead of copied to RAM; boot-debug text clamped to 10 chars so it fits 64 px; panel diagnostic now reports free heap *and largest free block* |
 | `main/main.c` | Display-init failure no longer fatal; AP portal left running; log capture init |
 | `main/mem_compat.h` **(new)** | `IMAGE_BUF_CAPS` — SPIRAM when available, internal RAM otherwise |
 | `main/diag.c` / `main/diag.h` **(new)** | In-RAM log ring buffer, served by `/diag` |
@@ -239,7 +266,13 @@ This repo keeps full upstream history — Gen1, Gen2, Tronbyt-S3, MatrixPortal-S
 
 ## Contributing
 
-Bench results are the most valuable contribution right now — specifically, any working combination of driver / latch blanking / clock phase / pixel clock for the FM6124 panel, logic-analyser captures of the HUB75 bus, and photos showing the corruption pattern. PRs welcome.
+The most valuable contribution right now is help with the single remaining blocker: **getting libwebp a contiguous ~12.5 KB free block on a 320 KB, no-PSRAM ESP32-S2** while keeping the WiFi stack alive. Concretely:
+
+- a heap free-block dump from a running board (the layout, not the totals — see [Work left to do](#work-left-to-do));
+- measurements of what the WiFi driver and the config portal actually cost in `MALLOC_CAP_INTERNAL`;
+- any working arrangement of task stacks, buffers or a pre-allocated decode arena that produces one large contiguous run.
+
+Note that the panel itself is **not** in question any more — a full-screen fill and legible text prove the pinout, timing and colour order are correct, so panel-driver sweeps and logic-analyser captures of the HUB75 bus are no longer where the problem lives. PRs welcome.
 
 ## License & credit
 

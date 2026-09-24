@@ -27,13 +27,19 @@ static const char *TAG = "gfx";
 #define GFX_TASK_CORE 1
 #endif
 #define GFX_TASK_PRIO 2
-#define GFX_TASK_STACK_SIZE 4092
+// The decode path runs libwebp inside this task, and libwebp's recursive
+// Huffman table construction adds to the depth. 4092 left under 1.2 KB spare on
+// the panel's stack watermark, and that reading was taken while decodes were
+// still failing early, so it understates a successful decode. The extra KiB is
+// cheap now that the WiFi code has been moved out of DIRAM.
+#define GFX_TASK_STACK_SIZE 6144
 
 struct gfx_state {
   TaskHandle_t task;
   SemaphoreHandle_t mutex;
   void *buf;
   size_t len;
+  bool buf_is_static;  // buf points into flash rodata and must not be freed
   int32_t dwell_secs;
   int counter;
   int loaded_counter;  // Counter that tracks which image has been loaded by gfx
@@ -73,13 +79,18 @@ static void display_text_fitted(const char *text, int x, int y, uint8_t r,
 // works even when the WebP path does not, so this is how we read state on a
 // board with no usable console. `tag` names the stage, `ok` the outcome.
 static void diag_panel(const char *tag, size_t len, bool ok) {
-  char a[16], b[16], c[16], d[16];
+  char a[32], b[32], c[32], d[32];
   snprintf(a, sizeof(a), "stk %u",
            (unsigned)uxTaskGetStackHighWaterMark(NULL));
   snprintf(b, sizeof(b), "webp %u", (unsigned)len);
   snprintf(c, sizeof(c), "%s %s", tag, ok ? "OK" : "ERR");
-  snprintf(d, sizeof(d), "heap %uk",
-           (unsigned)(esp_get_free_heap_size() / 1024));
+  // Total free heap is not the number that decides whether a decode fits: the
+  // decoder needs one large *contiguous* block, so report the largest free
+  // block too. 'h' = free heap, 'b' = largest free block, both in KiB.
+  snprintf(d, sizeof(d), "h%uk b%uk",
+           (unsigned)(esp_get_free_heap_size() / 1024),
+           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT) /
+                      1024));
   display_diag_show(a, b, c, d);
 }
 
@@ -101,15 +112,12 @@ int gfx_initialize(const char *img_url) {
   _state->paused = false;
   if (!nvs_get_skip_boot_animation()) {
     _state->len = ASSET_BOOT_WEBP_LEN;
-    ESP_LOGI(TAG, "calloc buff");
-    _state->buf = calloc(1, ASSET_BOOT_WEBP_LEN);
-    ESP_LOGI(TAG, "done calloc, copying");
-    if (_state->buf == NULL) {
-      ESP_LOGE("gfx", "Memory allocation failed!");
-      return 1;
-    }
-    memcpy(_state->buf, ASSET_BOOT_WEBP, ASSET_BOOT_WEBP_LEN);
-    ESP_LOGI(TAG, "done, copying");
+    // The asset already lives in flash rodata, which is memory-mapped, so hand
+    // the decoder that pointer instead of copying it into internal RAM. On a
+    // no-PSRAM S2 every KiB of heap counts, and the copied buffer would be dead
+    // weight for the whole boot animation.
+    _state->buf = (void *)ASSET_BOOT_WEBP;
+    _state->buf_is_static = true;
   }
 
   _state->mutex = xSemaphoreCreateMutex();
@@ -293,18 +301,21 @@ int gfx_update(void *webp, size_t len, int32_t dwell_secs) {
 
   // If a new frame arrives before the previous one is consumed by the gfx task,
   // free the old buffer here to prevent a memory leak (frame-dropping
-  // strategy).
+  // strategy). The boot asset is flash rodata, so it must not be freed.
   if (_state->buf) {
     ESP_LOGW(TAG,
              "Dropping queued image (counter %d) - new image arrived before it "
              "was displayed",
              _state->counter);
-    free(_state->buf);
+    if (!_state->buf_is_static) {
+      free(_state->buf);
+    }
     _state->buf = NULL;
   }
 
   // Take ownership of new buffer (no copy)
   _state->buf = webp;
+  _state->buf_is_static = false;
   _state->len = len;
   _state->dwell_secs = dwell_secs;
   _state->counter++;
@@ -412,6 +423,7 @@ void gfx_shutdown(void) { display_shutdown(); }
 static void gfx_loop(void *args) {
   ESP_LOGI(TAG, "gfx_loop ENTERED");
   void *webp = NULL;
+  bool webp_is_static = false;
   size_t len = 0;
   int32_t dwell_secs = 0;
   int counter = -1;
@@ -425,7 +437,7 @@ static void gfx_loop(void *args) {
 
     if (pdTRUE != xSemaphoreTake(_state->mutex, portMAX_DELAY)) {
       ESP_LOGE(TAG, "Could not take gfx mutex");
-      if (webp) {
+      if (webp && !webp_is_static) {
         free(webp);
         webp = NULL;
       }
@@ -435,8 +447,9 @@ static void gfx_loop(void *args) {
     // If there's new data, take ownership of buffer
     if (counter != _state->counter) {
       ESP_LOGI(TAG, "Displaying image counter=%d", _state->counter);
-      if (webp) free(webp);
+      if (webp && !webp_is_static) free(webp);
       webp = _state->buf;
+      webp_is_static = _state->buf_is_static;
       len = _state->len;
       dwell_secs = _state->dwell_secs;
       _state->buf = NULL;  // gfx_loop now owns the buffer
@@ -469,8 +482,9 @@ static void gfx_loop(void *args) {
         vTaskDelay(pdMS_TO_TICKS(1 * 1000));
         isAnimating = 0;
         // Free the invalid buffer to prevent re-drawing it
-        free(webp);
+        if (!webp_is_static) free(webp);
         webp = NULL;
+        webp_is_static = false;
         len = 0;
       }
       // keep webp around to loop until the next image arrives
@@ -480,34 +494,116 @@ static void gfx_loop(void *args) {
   }
 }
 
-// Reusable decode target.
+// Decode targets.
 //
-// WebPAnimDecoder allocates two full canvas buffers internally
-// (curr_frame and prev_frame_disposed, 2 x w*h*3 bytes) plus the VP8 decoder
-// state. On this board that allocation fails outright ("new ERR" on the panel):
-// the ESP32-S2 has only ~172 KB of data RAM in total and ~24 KB free here.
-// Decoding each frame into a single buffer we own - allocated once, before the
-// heap fragments - needs ~6 KB for a 64x32 frame and fits comfortably. This is
-// the same approach libwebp's own anim decoder uses per frame
-// (anim_decode.c: WebPDecode(fragment, size, config) with external memory),
-// minus its canvas bookkeeping.
-static uint8_t *s_dec_buf = NULL;
-static size_t s_dec_buf_size = 0;
+// Two buffers, both allocated once and reused for every image:
+//
+//   s_canvas  w*h*3  the composited frame, which is what gets pushed to the
+//                    panel (RGB, opaque).
+//   s_frame   w*h*4  one animation frame decoded to RGBA.
+//
+// Why the canvas and not WebPAnimDecoder: that needs two full canvas buffers
+// plus the VP8/VP8L working set, which does not fit the ESP32-S2's ~172 KB of
+// data RAM.
+//
+// Two ways to fill the canvas, chosen per image:
+//
+//   still (single frame)  decode MODE_RGB straight into the canvas at the
+//                         frame's offset. Cost: the RGB canvas only (6 KB at
+//                         64x32). This is what a Tronbyt server sends most of
+//                         the time, and it is exact.
+//   animation             decode each frame to RGBA in a scratch and composite
+//                         it, which is what libwebp's own animation decoder
+//                         does - but it needs a second buffer, because libwebp
+//                         decodes in place and therefore has to keep a
+//                         disposed copy of the canvas to blend against.
+//                         Decoding into a scratch instead of in place lets the
+//                         canvas itself hold the previous frame, so one extra
+//                         buffer is enough and no second canvas is ever held.
+//                         The result is byte-identical to WebPAnimDecoder's.
+//
+// The scratch is only taken when the decoder can still afford its own ~26 KB
+// working set afterwards (GFX_DECODE_HEADROOM); otherwise frames are drawn
+// directly, which positions them correctly but does not blend partial frames
+// over their predecessors.
+#define GFX_DECODE_HEADROOM (30 * 1024)
 
-static uint8_t *decode_buffer(size_t need) {
-  if (s_dec_buf != NULL && s_dec_buf_size >= need) {
-    return s_dec_buf;
+static uint8_t *s_canvas = NULL;
+static size_t s_canvas_size = 0;
+static uint8_t *s_frame = NULL;
+static size_t s_frame_size = 0;
+
+static bool grow_buffer(uint8_t **buf, size_t *capacity, size_t need) {
+  if (*capacity >= need) {
+    return true;
   }
-  if (s_dec_buf != NULL) {
-    free(s_dec_buf);
-    s_dec_buf = NULL;
-    s_dec_buf_size = 0;
+  uint8_t *grown = (uint8_t *)realloc(*buf, need);
+  if (grown == NULL) {
+    return false;
   }
-  s_dec_buf = (uint8_t *)malloc(need);
-  if (s_dec_buf != NULL) {
-    s_dec_buf_size = need;
+  *buf = grown;
+  *capacity = need;
+  return true;
+}
+
+// Mirror of libwebp's IsKeyFrame (anim_decode.c). A key frame means the canvas
+// is cleared before the frame is decoded rather than carried over.
+static bool is_key_frame(const WebPIterator *cur, const WebPIterator *prev,
+                         bool prev_was_key, int canvas_w, int canvas_h) {
+  if (cur->frame_num == 1) {
+    return true;
   }
-  return s_dec_buf;
+  if ((!cur->has_alpha || cur->blend_method == WEBP_MUX_NO_BLEND) &&
+      cur->width == canvas_w && cur->height == canvas_h) {
+    return true;
+  }
+  return prev->dispose_method == WEBP_MUX_DISPOSE_BACKGROUND &&
+         ((prev->width == canvas_w && prev->height == canvas_h) ||
+          prev_was_key);
+}
+
+// Alpha-composite one decoded RGBA frame onto the RGB canvas at the frame's own
+// offset. `blend` mirrors libwebp: only frames after the first, flagged
+// WEBP_MUX_BLEND and not key frames, are blended; everything else replaces.
+static void composite_frame(uint8_t *canvas, int canvas_w, int canvas_h,
+                            const uint8_t *frame, const WebPIterator *it,
+                            bool blend) {
+  for (int y = 0; y < it->height; y++) {
+    const int cy = it->y_offset + y;
+    if (cy < 0 || cy >= canvas_h) continue;
+    for (int x = 0; x < it->width; x++) {
+      const int cx = it->x_offset + x;
+      if (cx < 0 || cx >= canvas_w) continue;
+      const uint8_t *src = frame + ((size_t)y * it->width + x) * 4;
+      uint8_t *dst = canvas + ((size_t)cy * canvas_w + cx) * 3;
+      const uint8_t a = src[3];
+      if (!blend || a == 255) {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+      } else if (a != 0) {
+        dst[0] = (uint8_t)((src[0] * a + dst[0] * (255 - a)) / 255);
+        dst[1] = (uint8_t)((src[1] * a + dst[1] * (255 - a)) / 255);
+        dst[2] = (uint8_t)((src[2] * a + dst[2] * (255 - a)) / 255);
+      }
+    }
+  }
+}
+
+// A frame that disposes to background clears its rectangle from the canvas so
+// the next frame blends against the cleared value.
+static void dispose_frame(uint8_t *canvas, int canvas_w, int canvas_h,
+                          const WebPIterator *it) {
+  if (it->dispose_method != WEBP_MUX_DISPOSE_BACKGROUND) return;
+  for (int y = 0; y < it->height; y++) {
+    const int cy = it->y_offset + y;
+    if (cy < 0 || cy >= canvas_h) continue;
+    for (int x = 0; x < it->width; x++) {
+      const int cx = it->x_offset + x;
+      if (cx < 0 || cx >= canvas_w) continue;
+      memset(canvas + ((size_t)cy * canvas_w + cx) * 3, 0, 3);
+    }
+  }
 }
 
 static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
@@ -517,19 +613,18 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
   int w = 0, h = 0;
   if (!WebPGetInfo(buf, len, &w, &h) || w <= 0 || h <= 0) {
     ESP_LOGE(TAG, "WebPGetInfo failed");
-    draw_error_indicator_pixel();
     diag_panel("info", len, false);
     return 1;
   }
 
-  const size_t need = (size_t)w * (size_t)h * 3;
-  uint8_t *out = decode_buffer(need);
-  if (out == NULL) {
-    ESP_LOGE(TAG, "decode buffer alloc failed (%u bytes)", (unsigned)need);
-    draw_error_indicator_pixel();
+  const size_t canvas_need = (size_t)w * (size_t)h * 3;
+  const size_t frame_need = (size_t)w * (size_t)h * 4;
+  if (!grow_buffer(&s_canvas, &s_canvas_size, canvas_need)) {
+    ESP_LOGE(TAG, "canvas alloc failed (%u bytes)", (unsigned)canvas_need);
     diag_panel("buf", len, false);
     return 1;
   }
+  uint8_t *const canvas = s_canvas;
 
   WebPData webpData;
   WebPDataInit(&webpData);
@@ -539,50 +634,101 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
   WebPDemuxer *demux = WebPDemux(&webpData);
   if (demux == NULL) {
     ESP_LOGE(TAG, "WebPDemux failed");
-    draw_error_indicator_pixel();
     diag_panel("dmux", len, false);
     return 1;
   }
 
-  const int64_t start_us = esp_timer_get_time();
-  while (esp_timer_get_time() - start_us < dwell_us && *isAnimating != -1 &&
-         !_state->paused) {
-    WebPIterator iter;
-    if (!WebPDemuxGetFrame(demux, 1, &iter)) {
-      break;
+  // Compositing needs an RGBA scratch, so only multi-frame images can want it,
+  // and only when taking it still leaves the decoder room to work. A still
+  // image therefore costs nothing but the canvas.
+  bool composite = false;
+  if (WebPDemuxGetI(demux, WEBP_FF_FRAME_COUNT) > 1) {
+    const size_t free_now = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    if (free_now >= frame_need + GFX_DECODE_HEADROOM &&
+        grow_buffer(&s_frame, &s_frame_size, frame_need)) {
+      composite = true;
+    } else {
+      ESP_LOGW(TAG,
+               "only %u bytes free - drawing frames directly without "
+               "compositing",
+               (unsigned)free_now);
     }
+  }
 
+  const int64_t start_us = esp_timer_get_time();
+  bool decoded_any = false;
+  bool failed_any = false;
+  WebPIterator prev;
+  memset(&prev, 0, sizeof(prev));
+  bool prev_was_key = false;
+  WebPIterator iter;
+
+  if (WebPDemuxGetFrame(demux, 1, &iter)) {
     do {
-      WebPDecoderConfig cfg;
-      if (!WebPInitDecoderConfig(&cfg)) {
-        diag_panel("cfg", len, false);
-        break;
+      const bool key = is_key_frame(&iter, &prev, prev_was_key, w, h);
+      if (composite && key) {
+        memset(canvas, 0, canvas_need);
       }
-      cfg.output.colorspace = MODE_RGB;
-      cfg.output.is_external_memory = 1;
-      cfg.output.u.RGBA.rgba = out;
-      cfg.output.u.RGBA.stride = w * 3;
-      cfg.output.u.RGBA.size = need;
-      cfg.options.no_fancy_upsampling = 1;
 
-      if (WebPDecode(iter.fragment.bytes, iter.fragment.size, &cfg) ==
-          VP8_STATUS_OK) {
-        display_draw(out, w, h, 3, 0, 1, 2);
-        diag_panel("dec", len, true);
-      } else {
-        diag_panel("dec1", len, false);
+      WebPDecoderConfig cfg;
+      bool ok = false;
+      if (WebPInitDecoderConfig(&cfg)) {
+        cfg.output.is_external_memory = 1;
+        cfg.options.no_fancy_upsampling = 1;
+        if (composite) {
+          // Decode to RGBA in the scratch so the canvas still holds the
+          // previous frame while we blend.
+          cfg.output.colorspace = MODE_RGBA;
+          cfg.output.u.RGBA.rgba = s_frame;
+          cfg.output.u.RGBA.stride = iter.width * 4;
+          cfg.output.u.RGBA.size = (size_t)iter.height * iter.width * 4;
+        } else {
+          // Decode straight into the canvas at the frame's own offset. This is
+          // where the previous code went wrong: it decoded every frame at the
+          // canvas origin with the canvas stride, so any frame smaller than the
+          // canvas (which is most animation frames) landed in the wrong place.
+          cfg.output.colorspace = MODE_RGB;
+          cfg.output.u.RGBA.rgba = canvas +
+                                   (size_t)iter.y_offset * (size_t)w * 3 +
+                                   (size_t)iter.x_offset * 3;
+          cfg.output.u.RGBA.stride = w * 3;
+          cfg.output.u.RGBA.size = (size_t)iter.height * (size_t)w * 3;
+        }
+        ok = WebPDecode(iter.fragment.bytes, iter.fragment.size, &cfg) ==
+             VP8_STATUS_OK;
       }
-      WebPFreeDecBuffer(&cfg.output);
+
+      if (ok) {
+        if (composite) {
+          composite_frame(canvas, w, h, s_frame, &iter,
+                          iter.frame_num > 1 &&
+                              iter.blend_method == WEBP_MUX_BLEND && !key);
+          dispose_frame(canvas, w, h, &iter);
+        }
+        display_draw(canvas, w, h, 3, 0, 1, 2);
+        decoded_any = true;
+      } else {
+        ESP_LOGE(TAG, "frame %d decode failed", iter.frame_num);
+        failed_any = true;
+      }
+
+      prev = iter;
+      prev_was_key = key;
 
       vTaskDelay(pdMS_TO_TICKS(iter.duration ? iter.duration : 100));
     } while (WebPDemuxNextFrame(&iter) && *isAnimating != -1 &&
-             !_state->paused &&
-             esp_timer_get_time() - start_us < dwell_us);
-
-    WebPDemuxReleaseIterator(&iter);
+             !_state->paused && esp_timer_get_time() - start_us < dwell_us);
   }
 
   WebPDemuxDelete(demux);
+
+  if (!decoded_any && failed_any) {
+    // Nothing rendered, so the panel is free to carry the diagnostic instead.
+    // On success we deliberately do not touch it: the picture is the output.
+    draw_error_indicator_pixel();
+    diag_panel("dec", len, false);
+    return 1;
+  }
 
   if (*isAnimating != -1) {
     *isAnimating = 0;
