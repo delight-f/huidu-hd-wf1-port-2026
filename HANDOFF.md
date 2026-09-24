@@ -130,6 +130,10 @@ Also note the S2 branch hard-codes `_div_num = (freq > 8000000) ? 2 : 4` and for
 
 Change one variable at a time via `/panel?...`, reboot, and check `/diag` to confirm which config is live before judging the panel. Remember the NVS-persistence gotcha (§3). To get a stable comparison, hold the server frame constant (the test server returns a fixed 226-byte 64×32 WebP).
 
+**No network? Use the button cycler.** The board's single push button is **GPIO 11** (`CONFIG_BUTTON_PIN`) — the same one read at boot for config mode. `main/panel_sweep.c` starts a polling task that, on a short press (after a 5 s grace period), advances to the next candidate config, writes it to NVS and reboots. The candidate list and its boot indicator colours are in `s_cfgs[]` in that file; the active one is logged as `panel config N/7 '<name>' drv=… spd=… lat=… ph=… dbfr=…` and shown on `/diag`. Because a solid fill renders correctly even when the panel is mis-configured, the boot colour is the "which config is live" indicator.
+
+This makes the whole sweep possible with nothing but the board and a power switch — no portal, no IP hunting. Add or reorder candidates directly in `s_cfgs[]`.
+
 ---
 
 ## 6. Code map (what changed and where)
@@ -142,7 +146,8 @@ Change one variable at a time via `/panel?...`, reboot, and check `/diag` to con
 | `main/mem_compat.h` | `IMAGE_BUF_CAPS` |
 | `main/diag.c` / `main/diag.h` | log ring buffer + `diag_init()` / `diag_log_copy()` |
 | `main/ap.c` | `/diag` and `/panel` handlers; `max_uri_handlers = 12` |
-| `main/CMakeLists.txt` | `diag.c` added to `SRCS` |
+| `main/panel_sweep.c` / `.h` | GPIO11 button → candidate panel-config cycler; boot indicator colour; NVS read/write of the overrides |
+| `main/CMakeLists.txt` | `diag.c` and `panel_sweep.c` added to `SRCS` |
 | `sdkconfig.defaults.huidu-wf1` | S2 target, 4 MB, no SPIRAM, WF1 board, **small boot asset**, `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y` |
 | `boards/max_app_4mb.csv` | single `factory` app slot — **OTA is impossible** without a new table |
 

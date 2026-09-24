@@ -168,6 +168,37 @@ http://<device-ip>/diag                  # captured log + active panel config
 
 `drv`: `0`=SHIFTREG, `1`=FM6124, `2`=FM6126A, `3`=ICN2038S, `4`=MBI5124, `5`=DP3246.
 
+### Button-driven config cycler (no network needed)
+
+The single push button on the board is wired to **GPIO 11** — the same button the
+firmware reads at boot to force config mode. Once the firmware is running, a
+short press **steps to the next candidate panel configuration**, saves it to NVS
+and reboots, so the right combination can be found with nothing but the board
+(presses are ignored for the first 5 s after boot so config mode still works).
+
+Each candidate is identified at boot by a **solid fill colour**. Solid fills
+render correctly even when the panel is otherwise mis-configured — a full-screen
+fill is invariant under row/timing errors — so the colour is a reliable
+"which config is live" indicator where on-screen text is not.
+
+| Idx | Config | Boot colour |
+| --- | ------ | ----------- |
+| 0 | board defaults | white |
+| 1 | `drv=1` (FM6124) `lat=4` | red |
+| 2 | `drv=1` `ph=0` | green |
+| 3 | `drv=1` `spd=0` (8 MHz) | blue |
+| 4 | `drv=2` (FM6126A) `lat=4` | yellow |
+| 5 | `drv=3` (ICN2038S) `lat=1` | magenta |
+| 6 | `drv=0` (SHIFTREG) `lat=4` 20 MHz | cyan |
+| 7 | `drv=1` `ph=0` `spd=0` | orange |
+
+The active index, name and parameters are also logged and shown on `/diag` as
+`panel config N/7 '<name>' drv=… spd=… lat=… ph=… dbfr=…`.
+
+> **Note:** these overrides live in NVS and survive reflashing. Clear them with
+> `/panel?clear=1` (or cycle back to index 0) before comparing against the
+> compiled-in defaults.
+
 ## Work left to do
 
 1. **Fix the corrupted image rendering** — the main blocker. Ranked candidates:

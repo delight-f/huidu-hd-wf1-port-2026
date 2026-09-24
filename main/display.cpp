@@ -7,6 +7,7 @@
 
 #include "font5x7.h"
 #include "nvs_settings.h"
+#include "panel_sweep.h"
 #if CONFIG_BOARD_TIDBYT_GEN2
 #define R1 5
 #define G1 23
@@ -314,18 +315,23 @@ int display_initialize(void) {
     return 1;
   }
 
-  // TEMP BENCH DIAGNOSTIC (remove once the panel is confirmed working):
-  // Paint solid R/G/B immediately after begin() so a single flash tells us
-  // whether the panel is driven end-to-end (pins, timing, DMA) independent of
-  // the WebP pipeline, brightness value, or any server content.
+#if CONFIG_BOARD_HUIDU_WF1
+  // TEMP BENCH DIAGNOSTIC (remove once the panel configuration is settled).
+  // Solid fills prove the panel is driven end-to-end: a full-screen fill is
+  // invariant under row/timing errors, so it cannot validate the scan path, but
+  // it does confirm the pins, OE/LAT/CLK and colour order. The final colour is
+  // the active panel-sweep config (see panel_sweep.c / the GPIO11 button).
   _matrix->setBrightness8(255);
   _matrix->fillScreenRGB888(255, 0, 0);
-  vTaskDelay(pdMS_TO_TICKS(1500));
+  vTaskDelay(pdMS_TO_TICKS(500));
   _matrix->fillScreenRGB888(0, 255, 0);
-  vTaskDelay(pdMS_TO_TICKS(1500));
+  vTaskDelay(pdMS_TO_TICKS(500));
   _matrix->fillScreenRGB888(0, 0, 255);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  panel_sweep_indicator();
   vTaskDelay(pdMS_TO_TICKS(1500));
   _matrix->clearScreen();
+#endif
 
   // Apply stored brightness immediately so reboots (especially at night with
   // brightness 0) don't flash the boot animation at full brightness.

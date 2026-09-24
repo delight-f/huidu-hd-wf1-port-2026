@@ -20,6 +20,7 @@
 #include "mem_compat.h"
 #include "nvs_settings.h"
 #include "ota.h"
+#include "panel_sweep.h"
 #include "remote.h"
 #include "sdkconfig.h"
 #include "sntp.h"
@@ -524,6 +525,11 @@ void app_main(void) {
                                  .pull_down_en = GPIO_PULLDOWN_DISABLE,
                                  .intr_type = GPIO_INTR_DISABLE};
   gpio_config(&button_config);
+
+#if CONFIG_BOARD_HUIDU_WF1
+  // Bench bring-up: GPIO11 button steps through candidate panel configs.
+  panel_sweep_start();
+#endif
 
   // Check if button is pressed (active low with pull-up)
   button_boot = (gpio_get_level(CONFIG_BUTTON_PIN) == 0);
