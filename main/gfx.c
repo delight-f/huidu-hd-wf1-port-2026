@@ -46,6 +46,25 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
                      volatile int32_t *isAnimating);
 static void send_websocket_notification(int counter);
 
+// The panel is 64 px wide and the font is a 5 px glyph plus a 1 px gap, so at
+// most 10 characters fit on a line. The URL host / path / version strings can
+// be longer than that (e.g. an IPv4 host is 14 chars), so clamp them.
+#define GFX_MAX_TEXT_CHARS (64 / 6)
+static void display_text_fitted(const char *text, int x, int y, uint8_t r,
+                                uint8_t g, uint8_t b) {
+  if (text == NULL) {
+    return;
+  }
+  char buf[GFX_MAX_TEXT_CHARS + 1];
+  size_t n = strlen(text);
+  if (n > GFX_MAX_TEXT_CHARS) {
+    n = GFX_MAX_TEXT_CHARS;
+  }
+  memcpy(buf, text, n);
+  buf[n] = '\0';
+  display_text(buf, x, y, r, g, b, 1);
+}
+
 int gfx_initialize(const char *img_url) {
   // Only initialize once
   if (_state) {
@@ -147,7 +166,7 @@ int gfx_initialize(const char *img_url) {
       // Display host at the top, left-aligned
       if (strlen(host_only) > 0) {
         ESP_LOGI(TAG, "Displaying host: '%s' at y=0", host_only);
-        display_text(host_only, 0, 0, 255, 255, 255, 1);
+        display_text_fitted(host_only, 0, 0, 255, 255, 255);
       }
 
       // Display last 11 chars of path components in the middle, left-aligned
@@ -161,7 +180,7 @@ int gfx_initialize(const char *img_url) {
         }
 
         ESP_LOGI(TAG, "Displaying path components: '%s' at y=10", display_path);
-        display_text(display_path, 0, 10, 255, 255, 255, 1);
+        display_text_fitted(display_path, 0, 10, 255, 255, 255);
       } else {
         ESP_LOGW(TAG, "No path components found to display");
       }
@@ -173,10 +192,17 @@ int gfx_initialize(const char *img_url) {
     display_fill_rect(box_x + 4, 20, 3, 3, 0, 255, 0);  // Green box
     display_fill_rect(box_x + 8, 20, 3, 3, 0, 0, 255);  // Blue box
 
-    // Display version at the bottom, centered
-    int text_width = strlen(version_text) * 6;
+    // Display version at the bottom, centered (clamped to the panel width)
+    size_t version_chars = strlen(version_text);
+    if (version_chars > GFX_MAX_TEXT_CHARS) {
+      version_chars = GFX_MAX_TEXT_CHARS;
+    }
+    int text_width = (int)version_chars * 6;
     int x = (64 - text_width) / 2;
-    display_text(version_text, x, 24, 255, 255, 255, 1);
+    if (x < 0) {
+      x = 0;
+    }
+    display_text_fitted(version_text, x, 24, 255, 255, 255);
 
     // Flip the buffer once to show all three text lines at the same time
     display_flip();

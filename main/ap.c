@@ -5,13 +5,16 @@
 #include <esp_netif.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <esp_system.h>
 #include <esp_wifi.h>
 #include <lwip/sockets.h>
+#include <nvs.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
 
+#include "diag.h"
 #include "mem_compat.h"
 #include "nvs_settings.h"
 #include "wifi.h"
@@ -316,6 +319,96 @@ static void stop_dns_server(void) {
   }
 }
 
+static esp_err_t diag_handler(httpd_req_t *req) {
+  char hdr[320];
+  int hdr_len = snprintf(
+      hdr, sizeof(hdr),
+      "reset_reason=%d\nfree_heap=%u\nfree_internal=%u\nlargest_internal=%u\n"
+      "free_dma=%u\nlargest_dma=%u\nbrightness=%u\n--- captured log ---\n",
+      (int)esp_reset_reason(), (unsigned)esp_get_free_heap_size(),
+      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+      (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+      (unsigned)nvs_get_brightness());
+
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_send_chunk(req, hdr, hdr_len);
+
+  char *log = malloc(4096);
+  if (log != NULL) {
+    size_t n = diag_log_copy(log, 4096);
+    if (n > 0) {
+      httpd_resp_send_chunk(req, log, n);
+    }
+    free(log);
+  }
+
+  httpd_resp_send_chunk(req, NULL, 0);
+  return ESP_OK;
+}
+
+// Set HUB75 panel driver/timing overrides in NVS and reboot so they take
+// effect. Examples: /panel?drv=3&lat=1  (drv 3 = ICN2038S), /panel?ph=0
+// (clock phase), /panel?clear=1 (revert to board defaults). The values actually
+// in use are logged and shown on /diag.
+static esp_err_t panel_handler(httpd_req_t *req) {
+  static const struct {
+    const char *query;
+    const char *key;
+  } params[] = {{"drv", "panel_drv"},
+                {"spd", "panel_spd"},
+                {"lat", "panel_lat"},
+                {"ph", "panel_ph"},
+                {"dbfr", "panel_dbfr"}};
+
+  char query[128] = {0};
+  bool have_query = httpd_req_get_url_query_len(req) > 0 &&
+                    httpd_req_get_url_query_str(req, query, sizeof(query)) ==
+                        ESP_OK;
+
+  nvs_handle_t h;
+  if (nvs_open("wifi_config", NVS_READWRITE, &h) != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                        "nvs open failed");
+    return ESP_FAIL;
+  }
+
+  char body[320];
+  size_t off = 0;
+  char val[16];
+
+  if (have_query &&
+      httpd_query_key_value(query, "clear", val, sizeof(val)) == ESP_OK) {
+    for (size_t i = 0; i < sizeof(params) / sizeof(params[0]); i++) {
+      nvs_erase_key(h, params[i].key);
+    }
+    off += snprintf(body + off, sizeof(body) - off, "cleared panel overrides\n");
+  } else {
+    for (size_t i = 0; i < sizeof(params) / sizeof(params[0]); i++) {
+      if (have_query && httpd_query_key_value(query, params[i].query, val,
+                                              sizeof(val)) == ESP_OK) {
+        int32_t v = atoi(val);
+        nvs_set_i32(h, params[i].key, v);
+        off += snprintf(body + off, sizeof(body) - off, "set %s=%d\n",
+                        params[i].key, (int)v);
+      }
+    }
+  }
+
+  nvs_commit(h);
+  nvs_close(h);
+
+  off += snprintf(body + off, sizeof(body) - off,
+                  "\nrebooting to apply\n");
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  esp_restart();
+  return ESP_OK;
+}
+
 esp_err_t ap_start(void) {
   if (s_server != NULL) {
     ESP_LOGI(TAG, "Web server already started");
@@ -323,6 +416,7 @@ esp_err_t ap_start(void) {
   }
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.max_uri_handlers = 12;
   config.max_resp_headers = 16;
   config.recv_wait_timeout = 10;
   config.send_wait_timeout = 10;
@@ -353,6 +447,18 @@ esp_err_t ap_start(void) {
                             .handler = update_handler,
                             .user_ctx = NULL};
   httpd_register_uri_handler(s_server, &update_uri);
+
+  httpd_uri_t diag_uri = {.uri = "/diag",
+                          .method = HTTP_GET,
+                          .handler = diag_handler,
+                          .user_ctx = NULL};
+  httpd_register_uri_handler(s_server, &diag_uri);
+
+  httpd_uri_t panel_uri = {.uri = "/panel",
+                           .method = HTTP_GET,
+                           .handler = panel_handler,
+                           .user_ctx = NULL};
+  httpd_register_uri_handler(s_server, &panel_uri);
 
   httpd_uri_t hotspot_detect_uri = {.uri = "/hotspot-detect.html",
                                     .method = HTTP_GET,

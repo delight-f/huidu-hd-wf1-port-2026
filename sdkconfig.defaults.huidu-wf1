@@ -4,10 +4,18 @@
 # clock phase, latch blanking, and swap_colors may need bench iteration.
 CONFIG_BOARD_HUIDU_WF1=y
 CONFIG_BUTTON_PIN=11
-CONFIG_BOOT_WEBP_TRONBYT=y
+# Boot animation. MUST be a small asset: gfx_initialize() calloc()s the whole
+# WebP into internal RAM, and the S2 here has no PSRAM. BOOT_WEBP_TRONBYT is
+# 174 KB and fails to allocate, which makes gfx_initialize() return non-zero and
+# app_main exit before it starts the display or the config portal. Parrot is
+# ~4.5 KB (same choice the no-PSRAM pixoticker target uses).
+CONFIG_BOOT_WEBP_PARROT=y
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_HTTP_BUFFER_SIZE_MAX=60000
 CONFIG_HTTP_BUFFER_SIZE_DEFAULT=10000
 CONFIG_IDF_TARGET="esp32s2"
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="boards/max_app_4mb.csv"
 CONFIG_SPIRAM=n
+# Capture panics to the coredump partition so a reset loop can be diagnosed
+# without a console (the board has no UART bridge and S2 USB-CDC is unusable).
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y

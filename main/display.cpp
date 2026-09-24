@@ -1,6 +1,9 @@
 #include "display.h"
 
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <nvs.h>
 
 #include "font5x7.h"
 #include "nvs_settings.h"
@@ -201,22 +204,44 @@ static const char *TAG = "display";
 #define BRIGHTNESS_8BIT_MAX 230
 #endif
 
-// HUB75 panel driver and timing, per board. The Huidu HD-WF1 uses the values
-// proven on this exact board in mrcodetastic/HD-WF1-WF2-LED-MatrixPanel-DMA
-// (64x32 panel, 20 MHz pixel clock, latch blanking 4, default shift-register
-// driver). If the WF1 panel is blank or garbled on first flash, try in order:
-// PANEL_DRIVER -> FM6126A (some WF1 panels ship ICN2038S), then
-// PANEL_LATCH_BLANKING -> 1, then PANEL_I2S_SPEED -> HZ_10M.
-// All other boards keep the upstream defaults.
+// Panel driver/timing defaults per board. Overridable at runtime via the
+// /panel endpoint (NVS keys panel_drv/spd/lat/ph/dbfr) so the right combination
+// for a given panel can be found on the bench without reflashing.
+//   drv: 0=SHIFTREG 1=FM6124 2=FM6126A 3=ICN2038S 4=MBI5124 5=DP3246
+//   spd: 0=8MHz 1=20MHz
+// The WF1 BCM framebuffer lives in DMA-capable internal RAM and this S2 has no
+// PSRAM, so double buffering stays off there (the reference uses the library
+// default off as well).
 #if CONFIG_BOARD_HUIDU_WF1
-#define PANEL_DRIVER HUB75_I2S_CFG::SHIFTREG
-#define PANEL_I2S_SPEED HUB75_I2S_CFG::HZ_20M
-#define PANEL_LATCH_BLANKING 4
+#define PANEL_DRIVER_DEF 1 /* FM6124 - the panel's LED driver ICs */
+#define PANEL_SPEED_DEF 1  /* 20 MHz */
+#define PANEL_LATCH_DEF 1
+#define PANEL_DBUFF_DEF 0
 #else
-#define PANEL_DRIVER HUB75_I2S_CFG::FM6126A
-#define PANEL_I2S_SPEED HUB75_I2S_CFG::HZ_10M
-#define PANEL_LATCH_BLANKING 1
+#define PANEL_DRIVER_DEF 2 /* FM6126A */
+#define PANEL_SPEED_DEF 0  /* 8 MHz */
+#define PANEL_LATCH_DEF 1
+#define PANEL_DBUFF_DEF 1
 #endif
+
+#if CONFIG_NO_INVERT_CLOCK_PHASE
+#define PANEL_PHASE_DEF 0
+#else
+#define PANEL_PHASE_DEF 1
+#endif
+
+static int panel_cfg_get(const char *key, int def) {
+  nvs_handle_t h;
+  if (nvs_open("wifi_config", NVS_READONLY, &h) != ESP_OK) {
+    return def;
+  }
+  int32_t v = def;
+  if (nvs_get_i32(h, key, &v) != ESP_OK) {
+    v = def;
+  }
+  nvs_close(h);
+  return (int)v;
+}
 
 static inline uint8_t brightness_percent_to_8bit(uint8_t pct) {
   return (uint8_t)(((uint32_t)pct * BRIGHTNESS_8BIT_MAX + 50) / 100);
@@ -251,22 +276,33 @@ int display_initialize(void) {
                                   pin_BL2, CH_A,   CH_B,    CH_C,   CH_D,
                                   CH_E,    LAT,    OE,      CLK};
 
-#if CONFIG_NO_INVERT_CLOCK_PHASE
-  bool invert_clock_phase = false;
-#else
-  bool invert_clock_phase = true;
-#endif
+  int drv = panel_cfg_get("panel_drv", PANEL_DRIVER_DEF);
+  int spd = panel_cfg_get("panel_spd", PANEL_SPEED_DEF);
+  int latch = panel_cfg_get("panel_lat", PANEL_LATCH_DEF);
+  int ph = panel_cfg_get("panel_ph", PANEL_PHASE_DEF);
+  int dbfr = panel_cfg_get("panel_dbfr", PANEL_DBUFF_DEF);
+  if (drv < 0 || drv > 5) {
+    drv = PANEL_DRIVER_DEF;
+  }
+  if (latch < 1) {
+    latch = 1;
+  }
+  if (latch > 8) {
+    latch = 8;
+  }
+  ESP_LOGI(TAG,
+           "Panel config: driver=%d speed=%d latch_blanking=%d phase=%d "
+           "double_buff=%d",
+           drv, spd, latch, ph, dbfr);
 
-  HUB75_I2S_CFG mxconfig(WIDTH,                   // width
-                         HEIGHT,                  // height
-                         1,                       // chain length
-                         pins,                    // pin mapping
-                         PANEL_DRIVER,            // driver chip
-                         HUB75_I2S_CFG::TYPE138,  // line driver
-                         true,                    // double-buffering
-                         PANEL_I2S_SPEED,         // clock speed
-                         PANEL_LATCH_BLANKING,    // latch blanking
-                         invert_clock_phase       // invert clock phase
+  HUB75_I2S_CFG mxconfig(
+      WIDTH, HEIGHT, 1, pins,
+      (HUB75_I2S_CFG::shift_driver)drv,  // driver chip
+      HUB75_I2S_CFG::TYPE138,            // line driver
+      dbfr != 0,                         // double-buffering
+      spd ? HUB75_I2S_CFG::HZ_20M : HUB75_I2S_CFG::HZ_10M,  // clock speed
+      (uint8_t)latch,                                        // latch blanking
+      ph != 0                                                // invert clock phase
   );
 
   _matrix = new MatrixPanel_I2S_DMA(mxconfig);
@@ -277,6 +313,19 @@ int display_initialize(void) {
     _matrix = NULL;
     return 1;
   }
+
+  // TEMP BENCH DIAGNOSTIC (remove once the panel is confirmed working):
+  // Paint solid R/G/B immediately after begin() so a single flash tells us
+  // whether the panel is driven end-to-end (pins, timing, DMA) independent of
+  // the WebP pipeline, brightness value, or any server content.
+  _matrix->setBrightness8(255);
+  _matrix->fillScreenRGB888(255, 0, 0);
+  vTaskDelay(pdMS_TO_TICKS(1500));
+  _matrix->fillScreenRGB888(0, 255, 0);
+  vTaskDelay(pdMS_TO_TICKS(1500));
+  _matrix->fillScreenRGB888(0, 0, 255);
+  vTaskDelay(pdMS_TO_TICKS(1500));
+  _matrix->clearScreen();
 
   // Apply stored brightness immediately so reboots (especially at night with
   // brightness 0) don't flash the boot animation at full brightness.
@@ -346,6 +395,9 @@ static inline void apply_color_order(uint8_t *r, uint8_t *g, uint8_t *b) {
 
 void display_draw(const uint8_t *pix, int width, int height, int channels,
                   int ixR, int ixG, int ixB) {
+  if (_matrix == NULL) {
+    return;
+  }
   color_order_t order = nvs_get_color_order();
   if (order >= COLOR_ORDER_MAX) order = COLOR_ORDER_RGB;
   const int src[3] = {ixR, ixG, ixB};
@@ -378,7 +430,11 @@ void display_draw(const uint8_t *pix, int width, int height, int channels,
   _matrix->flipDMABuffer();
 }
 
-void display_clear(void) { _matrix->clearScreen(); }
+void display_clear(void) {
+  if (_matrix != NULL) {
+    _matrix->clearScreen();
+  }
+}
 
 void display_draw_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
   apply_color_order(&r, &g, &b);

@@ -14,6 +14,7 @@ endif()
 
 # Conditionally include touch_control.c only for Tidbyt Gen2
 set(SRCS "main.c"
+         "diag.c"
          "display.cpp"
          "flash.c"
          "gfx.c"

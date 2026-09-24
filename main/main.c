@@ -12,6 +12,7 @@
 #include <webp/demux.h>
 
 #include "ap.h"
+#include "diag.h"
 #include "display.h"
 #include "esp_sntp.h"
 #include "flash.h"
@@ -509,6 +510,9 @@ static void websocket_event_handler(void* handler_args, esp_event_base_t base,
 void app_main(void) {
   const char* image_url = NULL;
 
+  // Capture logs for the /diag page - this board has no usable console.
+  diag_init();
+
   // delete here for 5 seconds to allow for serial port to connect.
   ESP_LOGI(TAG, "App Main Start");
 
@@ -567,8 +571,9 @@ void app_main(void) {
 
   // Setup the display.
   if (gfx_initialize(image_url)) {
+    // A display failure must not take the whole device down: carry on so the
+    // config portal (and /diag) still come up.
     ESP_LOGE(TAG, "failed to initialize gfx");
-    return;
   }
   esp_register_shutdown_handler(&display_shutdown);
 
@@ -699,9 +704,13 @@ void app_main(void) {
     }
   }
 
-  // When AP mode is enabled, auto-shutdown the AP after a short delay
+  // NOTE: upstream auto-shuts the AP down a couple of minutes after this point
+  // (ap_start_shutdown_timer() -> ap_stop() + switch to STA-only). That leaves
+  // the board with no network and no portal if the station link is not up, and
+  // it is the only way to read the on-device log on this board. Keep the portal
+  // available instead.
   if (nvs_get_ap_mode()) {
-    ap_start_shutdown_timer();
+    ESP_LOGI(TAG, "AP portal left running (auto-shutdown disabled)");
   }
 
   while (true) {
