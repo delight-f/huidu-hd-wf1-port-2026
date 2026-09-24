@@ -16,6 +16,7 @@
 #include "esp_sntp.h"
 #include "flash.h"
 #include "gfx.h"
+#include "mem_compat.h"
 #include "nvs_settings.h"
 #include "ota.h"
 #include "remote.h"
@@ -445,7 +446,7 @@ static void websocket_event_handler(void* handler_args, esp_event_base_t base,
           break;
         }
 
-        uint8_t* new_buf = heap_caps_realloc(webp, new_size, MALLOC_CAP_SPIRAM);
+        uint8_t* new_buf = heap_caps_realloc(webp, new_size, IMAGE_BUF_CAPS);
         if (new_buf == NULL) {
           ESP_LOGE(TAG, "Failed to allocate memory (%zu bytes)", new_size);
           if (webp) {
@@ -726,8 +727,8 @@ void app_main(void) {
   }
 
   ESP_LOGI(TAG, "Free heap: %" PRIu32, esp_get_free_heap_size());
-  ESP_LOGI(TAG, "Free PSRAM: %" PRIu32,
-           heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  ESP_LOGI(TAG, "Free image buffer pool: %" PRIu32,
+           heap_caps_get_free_size(IMAGE_BUF_CAPS));
   ESP_LOGI(TAG, "Free internal RAM: %" PRIu32,
            heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 

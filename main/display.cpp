@@ -201,6 +201,23 @@ static const char *TAG = "display";
 #define BRIGHTNESS_8BIT_MAX 230
 #endif
 
+// HUB75 panel driver and timing, per board. The Huidu HD-WF1 uses the values
+// proven on this exact board in mrcodetastic/HD-WF1-WF2-LED-MatrixPanel-DMA
+// (64x32 panel, 20 MHz pixel clock, latch blanking 4, default shift-register
+// driver). If the WF1 panel is blank or garbled on first flash, try in order:
+// PANEL_DRIVER -> FM6126A (some WF1 panels ship ICN2038S), then
+// PANEL_LATCH_BLANKING -> 1, then PANEL_I2S_SPEED -> HZ_10M.
+// All other boards keep the upstream defaults.
+#if CONFIG_BOARD_HUIDU_WF1
+#define PANEL_DRIVER HUB75_I2S_CFG::SHIFTREG
+#define PANEL_I2S_SPEED HUB75_I2S_CFG::HZ_20M
+#define PANEL_LATCH_BLANKING 4
+#else
+#define PANEL_DRIVER HUB75_I2S_CFG::FM6126A
+#define PANEL_I2S_SPEED HUB75_I2S_CFG::HZ_10M
+#define PANEL_LATCH_BLANKING 1
+#endif
+
 static inline uint8_t brightness_percent_to_8bit(uint8_t pct) {
   return (uint8_t)(((uint32_t)pct * BRIGHTNESS_8BIT_MAX + 50) / 100);
 }
@@ -244,11 +261,11 @@ int display_initialize(void) {
                          HEIGHT,                  // height
                          1,                       // chain length
                          pins,                    // pin mapping
-                         HUB75_I2S_CFG::FM6126A,  // driver chip
+                         PANEL_DRIVER,            // driver chip
                          HUB75_I2S_CFG::TYPE138,  // line driver
                          true,                    // double-buffering
-                         HUB75_I2S_CFG::HZ_10M,   // clock speed
-                         1,                       // latch blanking
+                         PANEL_I2S_SPEED,         // clock speed
+                         PANEL_LATCH_BLANKING,    // latch blanking
                          invert_clock_phase       // invert clock phase
   );
 

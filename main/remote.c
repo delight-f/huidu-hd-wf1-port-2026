@@ -11,6 +11,7 @@
 
 #include "display.h"
 #include "gfx.h"
+#include "mem_compat.h"
 #include "nvs_settings.h"
 #include "sdkconfig.h"
 #include "version.h"
@@ -154,7 +155,7 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
 
         // And reallocate
         void* new =
-            heap_caps_realloc(state->buf, state->size, MALLOC_CAP_SPIRAM);
+            heap_caps_realloc(state->buf, state->size, IMAGE_BUF_CAPS);
         if (new == NULL) {
           ESP_LOGE(TAG, "Resizing response buffer failed");
           free(state->buf);
@@ -202,7 +203,7 @@ int remote_get(const char* url, uint8_t** buf, size_t* len,
   // State for processing the response
   struct remote_state state = {
       .buf =
-          heap_caps_malloc(CONFIG_HTTP_BUFFER_SIZE_DEFAULT, MALLOC_CAP_SPIRAM),
+          heap_caps_malloc(CONFIG_HTTP_BUFFER_SIZE_DEFAULT, IMAGE_BUF_CAPS),
       .len = 0,
       .size = CONFIG_HTTP_BUFFER_SIZE_DEFAULT,
       .max = CONFIG_HTTP_BUFFER_SIZE_MAX,
