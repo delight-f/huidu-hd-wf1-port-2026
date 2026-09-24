@@ -11,7 +11,7 @@
 Tronbyt/WebP LED-matrix firmware ([tronbyt/firmware-esp32](https://github.com/tronbyt/firmware-esp32)) ported to the **Huidu HD-WF1** — an **ESP32-S2** (single-core, 4 MB flash, no PSRAM) driving a **64×32 HUB75E** panel. It fetches WebP images from a URL or over a WebSocket, with a WiFi captive portal for setup.
 
 > [!IMPORTANT]
-> **Bottom line after first bench bring-up: the firmware runs, joins WiFi and talks to the Tronbyt server, but the panel still renders corrupted output** (random red/green/blue dots) rather than a recognisable image. Everything up to and including the fetch loop is verified working on real hardware. See [Bring-up status](#bring-up-status) and [Work left to do](#work-left-to-do).
+> **Bottom line after bench bring-up: the firmware runs, the display works, but WebP images do not.** The panel, its timing and its colour order are all demonstrably correct — the boot version screen is legible and solid R/G/B fills are the right colours. What fails is the **WebP decoder**, which cannot fit inside this chip's memory budget. The remaining work is memory-shaped, not display-config-shaped. See [Bring-up status](#bring-up-status) and [Work left to do](#work-left-to-do).
 
 ## Hardware
 
@@ -79,9 +79,9 @@ Verified on real hardware (ESP32-S2 rev v1.0, no embedded PSRAM):
 | Reaches the Tronbyt server and registers (visible in tronbyt-manager) | ✅ works |
 | Boot animation + version screen drawn on the panel | ✅ works (colours and blanking correct) |
 | Config portal, `/diag`, `/panel` | ✅ works |
-| **WebP image rendering** | ❌ **corrupted — random coloured dots, no recognisable image** |
+| **WebP image rendering** | ❌ **libwebp cannot decode in this chip's RAM** |
 
-Colour channel order and blanking are correct — a full-screen solid fill renders as the right colour — but any real image comes out as noise. See [Work left to do](#work-left-to-do).
+Colour channel order and blanking are correct — a full-screen solid fill renders as the right colour, and the boot version text is legible. The failure is confined to the WebP decode path. See [Work left to do](#work-left-to-do).
 
 ## Bring-up findings
 
@@ -128,9 +128,13 @@ The reference demo runs its panel as a plain shift-register type, and this port 
 
 **Fix:** `FM6124` is now the WF1 default driver (and `fm6124init()` does run — confirmed on the bench). This changed the output but did not solve the corruption.
 
-### 6. Open issue: image rendering is still corrupted
+### 6. The real blocker: libwebp cannot decode in the RAM this chip has
 
-With FM6124 init in place, the panel still renders noise. Solid fills look correct, which means the data pins, OE/LAT/CLK and the colour order are all right — but a full-screen fill is *invariant* under row-addressing and timing errors, so it cannot validate them. The corruption is therefore in the scan/timing path: wrong scan rate, clock phase, latch blanking, pixel clock, or the I²S/DMA data stream itself.
+Text and solid fills render correctly, which proves the panel, its timing and its colour order are all fine. What fails is the **WebP decoder** — the one component every other Tronbyt target has PSRAM to absorb.
+
+`idf.py size` shows the ESP32-S2 has only **~172 KB of data-capable RAM in total** (~90 KB of which is IRAM-resident code), leaving ~26 KB of heap after WiFi. `WebPAnimDecoder` allocates **two full canvas buffers** internally (`anim_decode.c:140-145`) plus VP8 decoder state; that cannot be satisfied from ~24 KB of fragmented heap, so `WebPAnimDecoderNew()` returned NULL — reported on the panel as `new ERR`.
+
+`gfx.c` therefore no longer uses it. It now does `WebPGetInfo` → one reusable buffer we own (`decode_buffer()`, ~6 KB for 64×32 RGB) → `WebPDemux` → `WebPDecode` per frame with `output.is_external_memory = 1`. That gets past allocation but currently fails at the per-frame decode step (`dec1 ERR`); the handoff documents the exact divergence from libwebp's own frame decoder and what to try next.
 
 ### Tooling note: there is no usable serial console on this board
 
@@ -152,6 +156,8 @@ Tried so far (WF1 defaults otherwise: 64×32, chain 1, `TYPE138`, double-bufferi
 | `FM6124` (init runs) | 1 | inverted | 20 MHz | **still corrupted** |
 | `FM6124` (init runs) | 4 | inverted | 20 MHz | **still corrupted** |
 | any | any | either | either | ✅ solid R/G/B fills correct; ❌ images corrupted |
+
+> **These settings are not the cause of the current failure.** They were swept before it was established that the panel renders correctly (text and fills) and that the real fault is the WebP decoder's memory footprint. They are documented here so nobody repeats the sweep. The tunables still exist — see [Runtime panel tuning](#runtime-panel-tuning-panel).
 
 ## Runtime panel tuning (`/panel`)
 
@@ -201,11 +207,10 @@ The active index, name and parameters are also logged and shown on `/diag` as
 
 ## Work left to do
 
-1. **Fix the corrupted image rendering** — the main blocker. Ranked candidates:
-   - **HUB75 library version.** The reference project pulls the library's **master** while this port pins **v3.0.14** (`f17fb7f`), and the reference builds under Arduino/IDF 5.3 vs native IDF 5.5 here. The ESP32-S2 I²S-parallel backend differs between versions; try bumping the library.
-   - **Clock phase / latch blanking / pixel clock** sweep via `/panel` (no re-flash needed once you can reach the device).
-   - **Panel scan rate / row addressing** — confirm the panel really is 1/16 scan for 64×32.
-   - Consider whether the upstream `-patched` I²S divider fix (`CONFIG_PATCH_I2S_DIVIDER`) is relevant for this S2 backend.
+1. **Make libwebp decode within the available RAM** — the sole remaining blocker. The low-memory path is in place (`WebPDemux` + `WebPDecode` into our own buffer) and currently fails per frame (`dec1 ERR`). Ranked next steps, with exact source pointers, are in [HANDOFF.md](HANDOFF.md#5-the-open-problem-and-exactly-where-to-look-next):
+   - mirror libwebp's own frame decode exactly — per-frame **offset** into the canvas, **canvas stride**, **frame-height** size, and RGBA (4 channels) rather than the RGB this port switched to;
+   - keep a persistent canvas if partial frames or `blend_method` compositing turn out to matter;
+   - only if that fails, free more RAM (lower HTTP buffers, disable lwIP IPv6) and retry `WebPAnimDecoder`.
 2. **Find the device's IP / regain portal access** for tuning — the station link hides the board from the AP's subnet; a phone on `TRON-CONFIG` or the router's DHCP list is the easiest route. Consider adding the board's own IP to the boot screen.
 3. **Remove the temporary bench diagnostic** (`main/display.cpp`: the R/G/B fill after `begin()`), or gate it behind a Kconfig option.
 4. **Decide the AP auto-shutdown behaviour** — it is currently disabled so `/diag` stays reachable; upstream shuts the AP down ~2 minutes after STA connects (and switches to STA-only, which leaves the board unreachable if the station link then drops).
