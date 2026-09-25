@@ -932,6 +932,12 @@ void app_main(void) {
       char* new_image_url = NULL;
       bool reboot_requested = false;
 
+      // Give the displayed image back before fetching. Holding it across the
+      // fetch is what leaves the heap too chopped to decode a later animation
+      // frame - see gfx_shed_retained(). Called before the timer so the reported
+      // fetch latency stays a network measurement.
+      gfx_shed_retained();
+
       // Start timing the HTTP fetch
       int64_t fetch_start_us = esp_timer_get_time();
       bool fetch_failed = !wifi_is_connected() ||

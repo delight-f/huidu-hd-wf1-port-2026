@@ -14,7 +14,8 @@ The port works: it boots, joins WiFi, fetches from the Tronbyt server and puts p
 | Board | Runs for many minutes with `reset_reason=1`; the old ~1-minute reset has not reproduced recently and is **not explained** |
 | Fetching | Works, IPv4 only, 29–326 ms typical. A 30 s timeout has been seen when the server was busy rendering |
 | Stills | Decode and display |
-| Animations | Small ones (218–538 B) decode, composite and display. A heavier ~13 KB animated app still fails its **second** frame — see §3 and §6 |
+| Animations | Decode and composite. The displayed image is now released before each fetch, so the decode gets one large contiguous block instead of competing with it (§3) |
+| Colour | Panel driven at 5 bits/channel, canvas is RGB565. **The 565 byte order is a trap** — see §7 |
 | Bench scaffolding | Removed (cycler, boot fills, on-panel readout). `/diag` and `/panel` remain |
 | Decode arena | Implemented, **deliberately disabled** — see §5 |
 | Depth / stacks / WiFi RX | Trimmed to 5-bit BCM, main 5120, gfx 4608, static RX 10 |
@@ -100,7 +101,9 @@ cp build/firmware.elf artifacts/$(date +%Y%m%d)-<what>.elf
 - **Small frames fail more readily than big ones.** Frame 1 is full-canvas; frame 2 is often an 18×22 patch — and it is frame 2 that OOMs, because the heap is more chopped after the first decode, not less.
 - **After the depth/canvas/stack/RX trims, verified on device:** boot heap after `ap_start` is **56,216 / 47,104** (was 41,084 / 32,768), so **+15.1 KB free and +14.3 KB of largest** at boot; `firmware.bin` is 1,258,096 B; and over a 2-minute sample all 18 reads showed `reset_reason=1`, so no resets. Small animations now composite and display with no warning.
 - **It is still not enough, and now the reason is specific.** At decode time the heap shows 33–42 KB *free* but only **14,336–18,432 B contiguous**, because `gfx.c` deliberately **keeps the previous image resident so its animation can loop** (*"keep webp around to loop until the next image arrives"*, `gfx_loop()`) while `main.c` receives the next payload. libwebp wants ~21.3 KB contiguous. So `frame 2 decode failed (out of memory)` persists for the ~13 KB app, and the compositing gate — which needs 38,912 B free — is still refused at 32,916–37,656.
-- **That makes the next fix structural, not another KB trim.** Total free is no longer the binding constraint; the coexistence of the retained image and the incoming payload is. Releasing the retained bytes for the duration of a fetch is the promising move, and it should be invisible: the HUB75 driver holds its own framebuffer, so the panel keeps showing the last drawn frame while an animation's loop is paused. Confirm the panel really does hold that frame before relying on it.
+- **Fixed by removing the coexistence, not by finding more bytes.** `gfx_shed_retained()` (called by the main loop just before each fetch) asks the gfx task to drop the displayed image and cut its current pass short; the task frees it at the top of its loop and sets `s_shed_done`, and `gfx_queue()` clears the request when the next image arrives. The wait is bounded (~1 s), so a mid-frame shed degrades to the previous behaviour rather than stalling the display.
+- **Why that is safe — the thing to hold on to:** the **HUB75 driver keeps its own framebuffer**, and the matrix is refreshed from that framebuffer by DMA, not from anything the application holds. Once a frame has been pushed, the compressed WebP is dead weight. So the panel simply holds its last drawn frame for the length of a fetch (tens to a few hundred ms) and resumes when the next image is queued. It also explains why the arena in §5 was never needed: the memory that had to be given back was already unreferenced.
+- **Not yet verified on hardware.** Both this and the 565 fix were built after the last flash. Watch `largest_internal` at decode time — it has to clear ~21,320 — and check that the ~13 KB animated app decodes all of its frames.
 
 ---
 
@@ -136,8 +139,8 @@ It is kept in `gfx.c` behind `GFX_DECODE_ARENA_ENABLED 0` with the full reasonin
 
 ## 6. What I would do next, in order
 
-1. **The trims landed — confirmed on device.** Boot heap after `ap_start` is 56,216 / 47,104, `firmware.bin` is 1,258,096 B, and the board is stable across minutes. See §3.
-2. **The open problem is no longer total memory; it is coexistence.** At decode time free is 33–42 KB but the largest contiguous run is only 14,336–18,432 B, because the previous image is retained so its animation can loop while the next payload arrives. Freeing those retained bytes for the duration of a fetch is the move — the panel should keep displaying its last drawn frame while the loop is paused, but **verify that on the panel first** (§3, last bullet).
+1. **The trims landed — confirmed on device.** Boot heap after `ap_start` is 56,216 / 47,104, and the board is stable across minutes. See §3.
+2. **Flash and verify the two fixes that are built but not yet on the board** — the retained-image shed and the RGB565 byte order. Check three things: a ~13 KB animated app decodes **all** its frames (no `frame 2 decode failed`); `largest_internal` at decode time clears ~21,320; and the panel shows true colours, judged against something known-white.
 3. **Only then re-open the arena**, sized by the numbers above. Remember it was parked for starving the *receive* path, so any give/take design has to leave a fetch its 6–8 KB.
 4. **Treat the payload ceiling as a last resort.** Dropping it to ~8 KB shrinks the payload term but refuses more apps, and the server is where oversized assets genuinely belong.
 5. **Measure the gfx task's stack watermark on a *successful* decode.** It was trimmed to 4,608 on a reading taken while decodes were failing, which understates the real peak. If it is tight, that shows up as a reset, and you are back in §7.
@@ -156,6 +159,7 @@ It is kept in `gfx.c` behind `GFX_DECODE_ARENA_ENABLED 0` with the full reasonin
 7. **`CONFIG_BOOT_WEBP_PARROT` must stay a small asset.** The boot WebP is decoded at startup; `BOOT_WEBP_TRONBYT` is 174 KB and cannot be allocated, which fails display init before the portal starts.
 8. **gpio0 is both the download strap and the button.** Keep that in mind before wiring anything to it.
 9. **`idf.py flash` rebuilds.** See §2 — it silently invalidates a preserved ELF.
+10. **libwebp's `MODE_RGB_565` output is not a native `uint16_t`.** `WEBP_SWAP_16BIT_CSP` defaults to 0, so both the lossy (`VP8YuvToRgb565`) and lossless (`VP8LConvertBGRAToRGB565_C`) paths write two bytes per pixel as `[rg][gb]`: byte 0 is red in bits 7..3 plus the top three bits of green, byte 1 is the rest of green plus blue. Reading the pair as a `uint16_t` on this little-endian part transposes the channels — it shows up as **near-white pixels turning blue or green**, while pure white and black survive, because the error cancels when both bytes are equal. `rgb_to_565()`/`rgb_from_565()` in `display.h` are the only place that layout is expressed; do not reimplement it inline. `tools/webp-host-harness/rgb565_check` proves it against an RGBA decode (byte-wise: exact, worst error 5; word-wise: wrong on 306 of 2061 opaque pixels of a real asset).
 
 ---
 
@@ -163,8 +167,8 @@ It is kept in `gfx.c` behind `GFX_DECODE_ARENA_ENABLED 0` with the full reasonin
 
 | File | Why it matters |
 | --- | --- |
-| `main/gfx.c` | **the file to work in.** `draw_webp()` (per-frame decode at each frame's own offset, optional RGBA scratch + key-frame/blend/dispose compositing, the `GFX_DECODE_HEADROOM` gate); `gfx_queue()`/`gfx_update()`; `gfx_reserve_decode_buffers()`; the disabled arena; `vp8_status_name()`; the boot heap trace. `GFX_TASK_STACK_SIZE 4608`. |
-| `main/display.cpp` | WF1 pin map; per-board panel defaults and `kPanelColorDepthBits` (now **5**); the RGB565 `display_draw` path; NULL-`_matrix` guards. |
+| `main/gfx.c` | **the file to work in.** `draw_webp()` (per-frame decode at each frame's own offset, optional RGBA scratch + key-frame/blend/dispose compositing, the `GFX_DECODE_HEADROOM` gate, the `s_shed_wanted` early-exit); `gfx_queue()`/`gfx_update()`; **`gfx_shed_retained()`** (the release-before-fetch handshake, §3); `gfx_reserve_decode_buffers()`; the disabled arena; `vp8_status_name()`; the boot heap trace. `GFX_TASK_STACK_SIZE 4608`. |
+| `main/display.cpp` / `.h` | WF1 pin map; per-board panel defaults and `kPanelColorDepthBits` (now **5**); `display_draw_565()`; and **`rgb_to_565()`/`rgb_from_565()` — the only place the 565 byte layout is written down** (trap 10). NULL-`_matrix` guards. |
 | `main/remote.c` | HTTP fetch; receive-buffer growth (this is what the arena starved); completeness checks. |
 | `main/main.c` | `app_main` boot order, the poll loop, the dwell sleep, fetch latency + stack watermark logging. |
 | `main/ap.c` / `.h` | `/diag`, `/panel`, `/save`, `/update`; `ap_start()`, `ap_retire_softap()`, `ap_start_dns()`. |

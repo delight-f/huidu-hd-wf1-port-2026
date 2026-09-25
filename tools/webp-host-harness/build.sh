@@ -3,11 +3,12 @@
 # decoder can be measured and its output inspected on a workstation instead of
 # by flashing the board.
 #
-#   ./build.sh          -> ./measure and ./render
+#   ./build.sh          -> ./measure, ./render and ./rgb565_check
 #   ./measure FILE...   decode peak transient heap per frame, under several
 #                       decoder options
 #   ./render FILE TAG   write render_TAG_{ref,naive,offset,scratch}.ppm montages
 #                       (ref = libwebp's own WebPAnimDecoder)
+#   ./rgb565_check FILE prove the MODE_RGB_565 byte layout against an RGBA decode
 #
 # __SSE2__ is undefined for the host build on purpose: the ESP-IDF component
 # compiles libwebp without SIMD, and the _sse2.c files are not in the source
@@ -40,8 +41,9 @@ CFLAGS="-O1 -g -U__SSE2__ -U__SSE4_1__ -U__AVX2__ -I $LW/src -I $LW"
 cc $CFLAGS -o measure measure.c memtrack.c $SRC -lm \
   -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free
 cc $CFLAGS -o render render.c $SRC -lm
+cc $CFLAGS -o rgb565_check rgb565_check.c $SRC -lm
 
-echo "built: ./measure ./render"
+echo "built: ./measure ./render ./rgb565_check"
 echo
 echo "sample assets to try:"
 echo "  components/assets/tronbyt.webp      (360 frames, lossless)"

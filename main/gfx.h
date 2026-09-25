@@ -24,6 +24,19 @@ int gfx_get_loaded_counter(void);
 int gfx_display_asset(const char* asset_type);
 void gfx_display_text(const char* text, int x, int y, uint8_t r, uint8_t g,
                       uint8_t b, int scale);
+// Release the displayed image so the next fetch is not competing with it.
+//
+// The gfx task normally keeps the compressed image so the animation can keep
+// looping between fetches. That retention is what stops a later animation frame
+// from decoding: at decode time the heap has 33-42 KB free but only ~14-18 KB of
+// it contiguous, because the retained image and the incoming payload are two
+// separate blocks and libwebp wants ~21 KB in one piece.
+//
+// Dropping it is invisible - the HUB75 driver keeps its own framebuffer, so the
+// panel holds the last drawn frame while the loop is paused, and the loop resumes
+// as soon as the next image is queued. Blocks briefly for the task to honour it.
+void gfx_shed_retained(void);
+
 void gfx_stop(void);
 void gfx_start(void);
 void gfx_shutdown(void);

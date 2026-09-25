@@ -24,7 +24,7 @@ That hardware is the interesting part. Every board Tronbyt already supported has
 | --- | --- |
 | **Board** | Huidu HD-WF1 — ESP32-S2, 4 MB flash, no PSRAM, single core |
 | **Panel** | 64×32 HUB75E, FM6124 driver ICs |
-| **Display path** | `WebPDemux` + per-frame `WebPDecode`, composited in a reused RGB canvas |
+| **Display path** | `WebPDemux` + per-frame `WebPDecode` into a reused RGB565 canvas, composited by hand |
 | **Transports** | HTTP polling (`http://`) and WebSocket push (`ws://` / `wss://`) |
 | **Config** | `secrets.json` → Kconfig defaults, or the on-device WiFi captive portal (NVS) |
 | **Observability** | `/diag` (log ring, boot heap trace, heap shape, reset reason) and `/panel` (HUB75 timing overrides) |
@@ -199,6 +199,13 @@ The board has roughly **43 KB** free once WiFi and the display are up, and less 
 
 Reserving memory to guarantee the decoder its runway was tried (see the arena row below) and made things worse, because the fetch needs 6–8 KB in one piece at the same time. The levers that genuinely raise this budget are the ones above: colour depth, canvas format, task stacks, WiFi buffers — and the receive ceiling, which bounds the largest payload.
 
+**The fix that mattered was not a lever at all.** After the trims the board still had 33–42 KB *free* at decode time but only 14–18 KB of it **contiguous**, because the gfx task deliberately keeps the compressed image so the animation can keep looping between fetches — while the main task is simultaneously receiving the next payload. Two large blocks, neither big enough. The fix was to stop the two coexisting: `gfx_shed_retained()` hands the displayed image back before each fetch.
+
+That is only safe because of how the panel is driven: **the HUB75 driver keeps its own framebuffer, and the matrix is refreshed from that framebuffer by DMA — not from anything the application holds.** Once a frame has been pushed, the compressed WebP is dead weight, so releasing it cannot change what is on screen. The animation holds its last drawn frame for the duration of the fetch (tens to a few hundred milliseconds) and the loop resumes as soon as the next image is queued. Nothing visibly changes, and the heap gets one large block back exactly when libwebp needs it.
+
+> [!NOTE]
+> **The canvas is RGB565, and libwebp's 565 is not a native `uint16_t`.** `WEBP_SWAP_16BIT_CSP` defaults to 0, so both the lossy and lossless paths write two bytes per pixel as `[rg][gb]` — byte 0 holds red in bits 7..3 plus the top of green, byte 1 the rest of green plus blue. Reading the pair as a `uint16_t` transposes the channels, and that mistake looks like **near-white pixels turning blue or green**; pure white and black survive it, because the error cancels when the two bytes are equal. `rgb_to_565()`/`rgb_from_565()` in `display.h` are the only place that layout is written down, and `tools/webp-host-harness/rgb565_check` proves it against an RGBA decode: the byte-wise reading is exact (worst error 5, i.e. quantisation) and the word-wise one is wrong on 306 of 2061 opaque pixels of a real asset.
+
 ### Tried, measured, and rejected
 
 Recorded so the next person does not repeat them:
@@ -348,12 +355,14 @@ sdkconfig.defaults.huidu-wf1  the WF1's tunables, each with its measurement
 
 ## Status and remaining work
 
-**Verified on hardware:** builds and flashes under ESP-IDF v5.5 for `esp32s2`; boots and pins tasks on the single core; joins WiFi and gets DHCP over IPv4; fetches real images from the Tronbyt server in tens to a few hundred milliseconds (29–326 ms measured); displays stills and animations; serves the config portal, `/diag` and `/panel`; and the decode/compositing logic is byte-identical to libwebp's own animation decoder on the host harness.
+**Verified on hardware:** builds and flashes under ESP-IDF v5.5 for `esp32s2`; boots and pins tasks on the single core; joins WiFi and gets DHCP over IPv4; fetches real images from the Tronbyt server in tens to a few hundred milliseconds (29–326 ms measured); displays stills and animations; serves the config portal, `/diag` and `/panel`; and the decode/compositing logic is byte-identical to libwebp's own animation decoder on the host harness. The memory trims are measured on the board — boot heap after `ap_start` is **56,216 free / 47,104 largest**, up from 41,084 / 32,768 — and hold steady over minutes of operation.
+
+**Built and host-verified, not yet run on hardware:** the retained-image release and the RGB565 byte-order fix. Success looks like a ~13 KB animated app decoding **all** of its frames (no `frame 2 decode failed`), `largest_internal` clearing ~21,320 at decode time, and true colours on the panel.
 
 **Open, in priority order:**
 
-1. **Decode success still depends on the heap's shape.** The biggest open item, and the cause of the wrong-pixel reports: at ~43 KB free the board cannot hold the payload, the decoder's ~21.3 KB, the canvas and the scratch at once, so either compositing is refused (alpha lost) or a later frame fails. See [the budget](#what-the-board-can-and-cannot-hold); the levers listed there are the way in, and none is a full fix on its own.
-2. **Guaranteeing the decoder a runway has not worked yet.** The arena is parked because it starves the receive path. Getting both to fit at once is the open design problem.
+1. **Confirm those two fixes on the board.** Until then the animation result is unverified, however good the reasoning.
+2. **If a decode still fails, read the heap's shape rather than its size** — `largest_internal` on `/diag`, not `free_heap`. The requirement is a single ~21 KB run, and three earlier fixes were aimed from totals and all missed. See [the budget](#what-the-board-can-and-cannot-hold).
 3. **The ~1-minute reset has not reproduced recently** — several multi-minute sessions have run with `reset_reason=1` throughout — but it was never explained, so it is not closed. If it returns: preserve the ELF, then decode the coredump with `espcoredump.py`; a backtrace names the frame.
 4. **The receive path** stalls part-way through large bodies; the 16 KB ceiling refuses those before the fetch now, which hides the worst of it.
 5. **The WebSocket path** is unverified against `tronbyt-manager` (the UI's "last seen" tracks the WebSocket, not the HTTP polling that drives the display).

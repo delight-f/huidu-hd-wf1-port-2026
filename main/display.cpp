@@ -435,17 +435,8 @@ void display_draw_565(const uint16_t *pix, int width, int height) {
 
   for (int i = 0; i < height; i++) {
     for (int j = 0; j < width; j++) {
-      const uint16_t p = pix[i * width + j];
-      // 5/6/5 expanded back to 8 bits with the high bits replicated into the low
-      // ones, so the full range is used instead of everything sitting dark.
-      const uint8_t r5 = (uint8_t)((p >> 11) & 0x1F);
-      const uint8_t g6 = (uint8_t)((p >> 5) & 0x3F);
-      const uint8_t b5 = (uint8_t)(p & 0x1F);
-      const uint8_t ch[3] = {
-          (uint8_t)((r5 << 3) | (r5 >> 2)),
-          (uint8_t)((g6 << 2) | (g6 >> 4)),
-          (uint8_t)((b5 << 3) | (b5 >> 2)),
-      };
+      uint8_t ch[3];
+      rgb_from_565(pix[i * width + j], &ch[0], &ch[1], &ch[2]);
       const uint8_t r = ch[map[0]];
       const uint8_t g = ch[map[1]];
       const uint8_t b = ch[map[2]];

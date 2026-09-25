@@ -53,6 +53,12 @@ struct gfx_state {
 
 static struct gfx_state *_state = NULL;
 
+// Set by the main task before each fetch: "release the image you are holding".
+// A plain flag written by one task and re-read continuously by the other is
+// enough for a one-way request like this.
+static volatile bool s_shed_wanted = false;
+static volatile bool s_shed_done = true;
+
 static void gfx_loop(void *arg);
 static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
                      volatile int32_t *isAnimating);
@@ -314,6 +320,11 @@ static int gfx_queue(void *webp, size_t len, int32_t dwell_secs,
   _state->dwell_secs = dwell_secs;
   _state->counter++;
   int counter = _state->counter;
+
+  // A new image supersedes any pending shed request: there is nothing stale left
+  // to release, and the loop should go back to holding what it is displaying.
+  s_shed_wanted = false;
+  s_shed_done = true;
   ESP_LOGI(TAG, "Queued image counter=%d size=%zu dwell=%d", counter, len,
            dwell_secs);
 
@@ -359,6 +370,30 @@ int gfx_get_loaded_counter(void) {
 
 int gfx_update(void *webp, size_t len, int32_t dwell_secs) {
   return gfx_queue(webp, len, dwell_secs, false);
+}
+
+void gfx_shed_retained(void) {
+  if (!_state) {
+    return;
+  }
+
+  // The flag goes up unconditionally: the gfx task also checks it between
+  // animation frames, so it doubles as "cut this pass short". Both are needed -
+  // one releases the bytes, the other bounds how long the release takes.
+  s_shed_done = false;
+  s_shed_wanted = true;
+
+  // Bounded wait. In the normal path this returns on the next tick: the main task
+  // only fetches once the animation's pass has finished, so the gfx task is
+  // already back at the top of its loop with nothing to do. The timeout only
+  // bites when the task is mid-frame or paused, and then the frame's own duration
+  // is the floor - so give up and fetch anyway rather than stalling the display.
+  for (int i = 0; i < 250 && !s_shed_done; i++) {
+    vTaskDelay(pdMS_TO_TICKS(4));
+  }
+  if (!s_shed_done) {
+    ESP_LOGW(TAG, "gfx task did not release the displayed image in time");
+  }
 }
 
 int gfx_display_asset(const char *asset_type) {
@@ -458,6 +493,22 @@ static void gfx_loop(void *args) {
       ESP_LOGE(TAG, "Could not give gfx mutex");
       continue;
     }
+
+    // Hand the displayed image back before the main task fetches the next one.
+    // See gfx_shed_retained() for why that is worth doing and why it is
+    // invisible on the panel. `webp`/`len`/`webp_is_static` are this task's own
+    // locals, so this needs no lock.
+    if (s_shed_wanted && webp != NULL && !webp_is_static) {
+      ESP_LOGI(TAG, "released the %u-byte displayed image for the next fetch",
+               (unsigned)len);
+      free(webp);
+      webp = NULL;
+      len = 0;
+      webp_is_static = false;
+    }
+    // Set either way: the request is satisfied whether this task was holding an
+    // image or not, and a static asset (a flash rodata screen) cannot be freed.
+    s_shed_done = true;
 
     static UBaseType_t last_stack_free = 0;
     UBaseType_t stack_free = uxTaskGetStackHighWaterMark(NULL);
@@ -717,14 +768,11 @@ static bool is_key_frame(const WebPIterator *cur, const WebPIterator *prev,
           prev_was_key);
 }
 
-// Pack for the 16-bit canvas. The composited canvas is RGB565 rather than RGB888:
-// it is the largest buffer held for the life of the session, so two bytes per
-// pixel instead of three is 2 KB back, and 5/6/5 resolves finer than the panel
-// itself can show (it is driven at 5 bits per channel).
-static inline uint16_t rgb_to_565(uint8_t r, uint8_t g, uint8_t b) {
-  return (uint16_t)(((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) |
-                    (uint16_t)(b >> 3));
-}
+// The canvas is RGB565 rather than RGB888: it is the largest buffer held for the
+// life of the session, so two bytes per pixel instead of three is 2 KB back, and
+// 5/6/5 resolves finer than the panel itself can show (it is driven at 5 bits per
+// channel). rgb_to_565()/rgb_from_565() live in display.h, which is the single
+// place that byte layout is expressed - it is deliberately not a native uint16_t.
 
 // Alpha-composite one decoded RGBA frame onto the canvas at the frame's own
 // offset. `blend` mirrors libwebp: only frames after the first, flagged
@@ -746,12 +794,8 @@ static void composite_frame(uint16_t *canvas, int canvas_w, int canvas_h,
       } else if (a != 0) {
         // Unpack the destination to blend against it, then repack. The precision
         // round-tripped here is below what the panel can display.
-        const uint16_t d = *dst;
-        const uint8_t dr =
-            (uint8_t)((((d >> 11) & 0x1F) << 3) | ((d >> 13) & 0x07));
-        const uint8_t dg =
-            (uint8_t)((((d >> 5) & 0x3F) << 2) | ((d >> 9) & 0x03));
-        const uint8_t db = (uint8_t)(((d & 0x1F) << 3) | ((d >> 2) & 0x07));
+        uint8_t dr, dg, db;
+        rgb_from_565(*dst, &dr, &dg, &db);
         *dst = rgb_to_565((uint8_t)((src[0] * a + dr * (255 - a)) / 255),
                           (uint8_t)((src[1] * a + dg * (255 - a)) / 255),
                           (uint8_t)((src[2] * a + db * (255 - a)) / 255));
@@ -943,7 +987,8 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
 
       vTaskDelay(pdMS_TO_TICKS(iter.duration ? iter.duration : 100));
     } while (WebPDemuxNextFrame(&iter) && *isAnimating != -1 &&
-             !_state->paused && esp_timer_get_time() - start_us < dwell_us);
+             !_state->paused && !s_shed_wanted &&
+             esp_timer_get_time() - start_us < dwell_us);
   }
 
   WebPDemuxDelete(demux);
