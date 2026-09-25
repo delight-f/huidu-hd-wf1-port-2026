@@ -27,9 +27,9 @@ That hardware is the interesting part. Every board Tronbyt already supported has
 | **Display path** | `WebPDemux` + per-frame `WebPDecode`, composited in a reused RGB canvas |
 | **Transports** | HTTP polling (`http://`) and WebSocket push (`ws://` / `wss://`) |
 | **Config** | `secrets.json` → Kconfig defaults, or the on-device WiFi captive portal (NVS) |
-| **Observability** | `/diag` (log ring, heap layout, reset reason), `/panel` (panel tuning), on-panel diagnostics |
+| **Observability** | `/diag` (log ring, boot heap trace, heap shape, reset reason) and `/panel` (HUB75 timing overrides) |
 | **Verified on hardware** | build & flash, boot, WiFi join, HTTP fetch, boot screen, config portal, panel output |
-| **Known open** | ~1-minute reset loop (cause unknown), refusing 20–33 KB animated apps, receive path stalls near 14 KB |
+| **Known open** | decode success depends on the heap's *shape*, not its size — animations render partially or unblended when the largest free run is small |
 | **Upstream base** | `tronbyt/firmware-esp32`, rebased onto `5013f42` (PR #161) |
 
 ---
@@ -42,7 +42,7 @@ That hardware is the interesting part. Every board Tronbyt already supported has
 | Panel | 64×32 HUB75E |
 | Panel driver ICs | **FM6124** (`fm6124init()` is run; the ICs must be initialised) |
 | Address lines | A–D (1/16 scan); the E line is wired to GPIO 12 |
-| Button | GPIO 11 (config mode at boot; panel-config cycler while running) |
+| Button | GPIO 11 (forces config mode at boot) |
 | Partition table | `boards/max_app_4mb.csv` — one `factory` slot, **no OTA** |
 | Serial console | **none** (no UART bridge; ESP32-S2 USB-CDC does not enumerate without TinyUSB) |
 | Download mode | Bridge the two GPIO0 pads beside the Micro-USB port, then power-cycle |
@@ -158,7 +158,15 @@ Multi-frame images need an 8 KB RGBA scratch to composite correctly. It used to 
 
 ### 11. Task stacks trimmed against measurements, not guesses
 
-Main task `6144` (watermark logged on every fetch: ~3.3 KB headroom), graphics task `6144`, timer task `2048`. The numbers are only trimmed once a watermark says they can be.
+Main task `5120`, graphics task `4608`, timer task `2048` — trimmed against the watermarks rather than by guess. This matters more than it looks: the graphics task's stack is 4.5 KB of the very heap the decoder wants, and the main task reports ~3.2 KB free on every single fetch.
+
+### 12. The bench scaffolding is gone, and its stack came back
+
+The button-driven panel-config cycler and the boot screens it was identified by have been deleted, along with the on-panel decode readout. The cycler's polling task held a **3,072-byte heap stack**, so removing it handed that much back — and `/diag` over the network had long since made the on-panel readout redundant.
+
+### 13. IPv6 is compiled out
+
+Nothing here needs it: the image URL is an IPv4 literal and OTA is impossible on this board (one factory slot in `max_app_4mb.csv`). What it cost was real — lwIP keeps neighbour-discovery state and a structure per address, and this network hands out several SLAAC addresses. The only thing depending on it was `ota.c`'s socket family, now guarded so the tree still builds with IPv6 enabled. Worth ~2 KB of internal RAM and ~31 KB of flash.
 
 ### What that bought
 
@@ -172,6 +180,25 @@ Boot heap, before and after (free / **largest contiguous block**):
 
 Largest free block went **7,936 → 36,864 bytes**; total internal heap roughly **20 KB → 52 KB**. The earlier blocker — libwebp unable to obtain a single contiguous 12,544-byte allocation — is gone.
 
+### What the board can and cannot hold
+
+The number that matters is not total free memory but what must be **live at the same moment**. At the instant of a decode that is:
+
+| Live at decode time | Size |
+| --- | --- |
+| Received payload (resident until the decode finishes) | up to 16 KB (the ceiling) |
+| libwebp's working set — an 11,816-byte buffer plus a ~9,504-byte one | ~21.3 KB |
+| The composited RGB canvas | 6 KB |
+| The RGBA scratch, when frames are to be blended | 8 KB |
+| **Worst case** | **~51 KB** |
+
+The board has roughly **43 KB** free once WiFi and the display are up, and less at runtime. It cannot hold all of that, and the shortfall surfaces as **two different failures that both just look like wrong pixels**:
+
+1. **Compositing is refused** — `only NNNNN bytes free - drawing frames directly without compositing`. The fallback decodes each frame to RGB and **drops alpha**, so an animation whose frames are partial or transparent paints wrong.
+2. **Later frames fail** — `frame 2 decode failed (out of memory)`. Frame 1 (full canvas) decodes, the heap is then too chopped for frame 2, and the animation renders **partially**.
+
+Reserving memory to guarantee the decoder its runway was tried (see the arena row below) and made things worse, because the fetch needs 6–8 KB in one piece at the same time. The levers that genuinely raise this budget are the ones above: colour depth, canvas format, task stacks, WiFi buffers — and the receive ceiling, which bounds the largest payload.
+
 ### Tried, measured, and rejected
 
 Recorded so the next person does not repeat them:
@@ -179,13 +206,14 @@ Recorded so the next person does not repeat them:
 | Attempt | Result |
 | --- | --- |
 | Move WiFi code out of IRAM (`IRAM_OPT=n`) | Frees DIRAM at link time, makes the **runtime** heap worse (24,948 → 20,368 free) |
-| Lower the panel's BCM colour depth 8 → 6 | Works, and is a bigger lever than expected (panel stage 44,808 → 22,100 B) — **but it changes panel timing**, since `nsPerRow` scales with depth |
+| Lower the panel's BCM colour depth | **Adopted**, now the WF1 default at 5 bits. Bigger than it looks — the framebuffer is ~2 KB per bit — but it shifts `nsPerRow` and so **changes panel timing**, which has to be judged on the panel (and only after a power-cycle, since a flash leaves collapsed rows) |
 | Raise `TCP_WND` to 11,680 | Much worse: 1,226-byte payloads went from 36 ms to 39–42 s |
 | Over-trim `STATIC_RX` / `DYNAMIC_RX` | Breaks the transport entirely (see §7) |
 | Decoder cropping / scaling options | Cropping is output-only (peak unchanged); scaling is **worse** (18,200 → 19,456 B) |
 | `WebPAnimDecoder` | Needs two full canvases plus the VP8 working set — strictly worse than driving the demuxer |
 | libwebp's internal 12,544-byte buffer | Not shrinkable by any decoder option (`AllocateInternalBuffers32b` allocates it regardless) |
-| Disable lwIP IPv6 | Not viable — `main/ota.c` uses IPv6 socket types unconditionally |
+| Disable lwIP IPv6 | **Done.** The only blocker was `ota.c`'s socket family, which is now guarded — the tree builds with IPv6 on or off. Worth ~2 KB of internal RAM and ~31 KB of flash |
+| Reserve a decode arena and hand it back per `WebPDecode` | Fixes the intermittent decode, but holding ~22 KB starves the receive path — the largest free run falls to ~4 KB and the board can no longer receive a 4 KB image. Parked behind `GFX_DECODE_ARENA_ENABLED 0`; see [the budget](#what-the-board-can-and-cannot-hold) |
 | Panel timing sweeps | Not the cause; text and solid fills render correctly throughout |
 
 ---
@@ -258,16 +286,17 @@ The WF1 has no UART-to-USB bridge, and ESP32-S2 USB-CDC does not enumerate in ES
 | `GET /diag` | Captured log ring, reset reason, free heap / free DMA heap |
 | `GET /diag?heap=1` | Free-block **distribution** and httpd/DNS task stack headroom |
 | `GET /panel?...` | HUB75 driver/timing overrides in NVS, then reboot |
-| On-panel `diag_panel()` | Four short lines: `stk`, `webp`, decode stage (`OK` / `info ERR` / `buf ERR` / `dmux ERR` / `dec ERR`), `hNNk bNNk` = free heap and **largest free block** |
-| Button cycler | Short GPIO 11 press steps through candidate panel configs, saves to NVS, reboots — identifiable by solid boot colour |
 | Coredumps | `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`; a panic can be decoded later with `espcoredump.py` |
 
 `reset_reason` is the quickest stability signal: `1` = power-on, `3` = software reset, `4` = **panic**.
 
-The on-panel diagnostic deliberately reports the **largest free block**, not just total heap. Three earlier fixes were aimed from totals rather than from the heap's shape and all three missed — a 12,544-byte contiguous requirement is a statement about the shape, not the total.
+`/diag` deliberately reports the **largest free block**, not just the total. Three earlier fixes were aimed from totals rather than from the heap's shape, and all three missed — a 12,544-byte contiguous requirement is a statement about the shape, not the total.
 
 > [!NOTE]
-> A red dot plus `dec ERR` on the panel may be **stale**. Nothing redraws the panel when an image later succeeds, so read `/diag` before believing the panel.
+> The **boot heap trace** is the highest-value part of `/diag`, and it is served from a fixed array rather than the log ring, because the 1 KB ring is overwritten within seconds of boot — the boot sequence is exactly the part that gets lost. Two known limits: the array holds 16 marks and the rendered report is capped at 768 bytes, so the newest marks (the arena reservation, `sta connected`) can be cut off. Widening the cap is a one-line change worth making.
+
+> [!NOTE]
+> There is no on-panel diagnostic any more. The board once painted decode state and heap figures onto the matrix during bring-up; the panel now shows the artwork only, and `/diag` is the only readout.
 
 ### Runtime panel tuning
 
@@ -281,7 +310,7 @@ http://<device-ip>/panel?clear=1         # back to compiled-in defaults
 
 `drv`: `0`=SHIFTREG, `1`=FM6124, `2`=FM6126A, `3`=ICN2038S, `4`=MBI5124, `5`=DP3246.
 
-The compiled defaults for the WF1 are **FM6124**, `TYPE138` line addressing, 20 MHz, latch blanking 1, double buffering **off**, 8-bit BCM. These overrides live in NVS and **survive reflashing** — clear them before comparing against the compiled defaults. Note that GPIO0 is both the download-mode strap and a panel-sweep probe pin.
+The compiled defaults for the WF1 are **FM6124**, `TYPE138` line addressing, 20 MHz, latch blanking 1, double buffering **off**, 5-bit BCM. These overrides live in NVS and **survive reflashing** — clear them before comparing against the compiled defaults.
 
 ---
 
@@ -307,7 +336,6 @@ main/
   ap.c / ap.h       config portal, /diag, /panel, /save, /update; SoftAP retirement
   diag.c / diag.h   log ring, boot heap trace, free-block histogram
   mem_compat.h      PSRAM-or-internal allocation caps
-  panel_sweep.c/.h  bench panel-config cycler (button-driven)
   nvs_settings.c/.h persisted settings
   Kconfig.projbuild board choices and feature flags
 components/assets/  built-in WebP screens (boot, config, 404, oversize, no-connect)
@@ -320,17 +348,18 @@ sdkconfig.defaults.huidu-wf1  the WF1's tunables, each with its measurement
 
 ## Status and remaining work
 
-**Verified on hardware:** builds and flashes under ESP-IDF v5.5 for `esp32s2`; boots and pins tasks on the single core; joins WiFi and gets DHCP; fetches real images from the Tronbyt server in tens to a few hundred milliseconds (43–326 ms measured, including 11 KB bodies); renders the boot animation and version screen with correct colour order and blanking; serves the config portal, `/diag` and `/panel` over both interfaces; the decode/compositing logic is byte-identical to libwebp's own animation decoder on the host harness.
+**Verified on hardware:** builds and flashes under ESP-IDF v5.5 for `esp32s2`; boots and pins tasks on the single core; joins WiFi and gets DHCP over IPv4; fetches real images from the Tronbyt server in tens to a few hundred milliseconds (29–326 ms measured); displays stills and animations; serves the config portal, `/diag` and `/panel`; and the decode/compositing logic is byte-identical to libwebp's own animation decoder on the host harness.
 
 **Open, in priority order:**
 
-1. **The ~1-minute reset.** One panic was captured and decoded and turned out to be a bug introduced during the bring-up (a `NULL` dereference in `remote.c`); a second was captured but not decoded, and no evidence yet says whether a second cause remains. **Preserve the ELF and decode the coredump before changing anything else** — a backtrace names the frame, which beats reasoning from symptoms.
-2. **Large animated apps.** 20–33 KB apps cannot fit (see [the animated-WebP section](#animated-webp-the-constraint-that-shapes-everything)). The options are to cap what the board attempts — the oversize screen now works, since it decodes in place from flash — or to fix the asset sizes at the server, which is where the problem really belongs.
-3. **The receive path** reaches ~14 KB and stalls on a 33 KB body; why it stops there is not established.
-4. **The WebSocket path** is unverified against `tronbyt-manager` (the UI's "last seen" tracks the WebSocket, not the HTTP polling that actually drives the display).
-5. **Nothing above is validated end-to-end.** Treat everything outside the verified list as a hypothesis, and do not trust a build until it has run for ten minutes without a reset.
+1. **Decode success still depends on the heap's shape.** The biggest open item, and the cause of the wrong-pixel reports: at ~43 KB free the board cannot hold the payload, the decoder's ~21.3 KB, the canvas and the scratch at once, so either compositing is refused (alpha lost) or a later frame fails. See [the budget](#what-the-board-can-and-cannot-hold); the levers listed there are the way in, and none is a full fix on its own.
+2. **Guaranteeing the decoder a runway has not worked yet.** The arena is parked because it starves the receive path. Getting both to fit at once is the open design problem.
+3. **The ~1-minute reset has not reproduced recently** — several multi-minute sessions have run with `reset_reason=1` throughout — but it was never explained, so it is not closed. If it returns: preserve the ELF, then decode the coredump with `espcoredump.py`; a backtrace names the frame.
+4. **The receive path** stalls part-way through large bodies; the 16 KB ceiling refuses those before the fetch now, which hides the worst of it.
+5. **The WebSocket path** is unverified against `tronbyt-manager` (the UI's "last seen" tracks the WebSocket, not the HTTP polling that drives the display).
+6. **Nothing is validated end-to-end.** Treat anything outside the verified list as a hypothesis.
 
-Smaller items: CI entry and `esp_idf_project_configuration.json` for `huidu-wf1`; OTA (impossible today — `boards/max_app_4mb.csv` has one `factory` slot, and two ~1.75 MB slots would fit a ~1.2 MB app in 4 MB); a third-party brightness ceiling for the WF1 (it currently falls back to the legacy 230 ≈ 90% duty); and removing the temporary bench diagnostics or gating them behind Kconfig.
+Smaller items: the `/diag` boot-trace report is capped at 768 bytes and can now truncate away its own newest marks (a one-line widen); CI entry and `esp_idf_project_configuration.json` for `huidu-wf1`; OTA (impossible today — one `factory` slot, and two ~1.75 MB slots would fit a ~1.2 MB app in 4 MB); a third-party brightness ceiling for the WF1 (it falls back to the legacy 230 ≈ 90% duty).
 
 ---
 

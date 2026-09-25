@@ -57,7 +57,12 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 # progress. Static buffers are allocated once at WiFi init, while the heap is
 # still one piece.
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=10
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=12
+# 12 -> 10, to hand two ~1.6 KB buffers back to the heap the decoder wants. The
+# over-trimming that broke the transport was down at 6, and the receive ceiling is
+# now 16,384, so the largest body this board will ever accept is ~16 KB rather than
+# the 22 KB that failed back then. Measure fetch latency either side of any further
+# cut: this is the setting that has already broken once.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16
 # A-MPDU stays off: it buys nothing for one HTTP fetch and costs block-ack window
@@ -67,8 +72,9 @@ CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=2048
 # Trimmed only after adding a watermark report to every fetch (see the print in
 # main.c) so the margin is known rather than assumed - esp_http_client is the
-# deepest thing this task does. Measured headroom: ~3.3 KB.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+# deepest thing this task does. Measured headroom ~3.2 KB on every fetch, so
+# 6144 -> 5120 still leaves more than 2 KB of that margin untouched.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=5120
 # Tried and REVERTED: raising TCP_WND to 11680 here, alongside restoring full TX
 # power, made the transport worse rather than better - 1,226-byte payloads went
 # from 36 ms to 39-42 s. Whatever governs this device's receive throughput, it is

@@ -305,17 +305,18 @@ int display_initialize(void) {
            drv, line, spd, latch, ph, dbfr);
 
   // Panel colour depth, in bits per channel. The driver's framebuffer is one
-  // uint16_t per pixel per bit per row, so 8 bits costs 16,384 bytes and 6 costs
-  // 12,288 - all of it internal DMA-capable RAM, which is the same pool
-  // libwebp's internal decode buffer must come from. This is a memory knob: 8 is
-  // not affordable on a no-PSRAM S2 alongside the decoder, and at 8 the largest
-  // free run drops far enough that frames stop decoding.
+  // uint16_t per pixel per bit per row, so every bit costs ~2 KB of internal
+  // DMA-capable RAM - the same pool libwebp's internal decode buffer has to come
+  // from. This is a memory knob set by arithmetic, not by taste: the simultaneous
+  // demand at decode time (payload + decoder + canvas + scratch) does not fit at
+  // 8, and what fails first is compositing and then the later frames of an
+  // animation, both of which show up as wrong pixels rather than as an error.
   //
-  // Note this also shifts the BCM bitplane timing (nsPerRow scales with depth),
-  // so it is a panel-behaviour change, not only a size change - judge it on the
-  // panel, and remember the panel shows collapsed rows after a flash until it
-  // has been power-cycled (HANDOFF.md section 6).
-  constexpr uint8_t kPanelColorDepthBits = 6;
+  // Note this also shifts the BCM bitplane timing (nsPerRow scales with depth), so
+  // it is a panel-behaviour change, not only a size change - judge it on the panel,
+  // and remember the panel shows collapsed rows after a flash until it has been
+  // power-cycled (HANDOFF.md).
+  constexpr uint8_t kPanelColorDepthBits = 5;
 
   HUB75_I2S_CFG mxconfig(
       WIDTH, HEIGHT, 1, pins,
@@ -397,9 +398,9 @@ static const uint8_t kChannelOrder[COLOR_ORDER_MAX][3] = {
     {2, 1, 0},  // bgr
 };
 
-// Remap a colour triple for panels whose RGB lines are permuted. display_draw()
-// applies the same table to its source indices instead, so its per-pixel loop
-// pays nothing; the helpers below receive a colour directly and permute once.
+// Remap a colour triple for panels whose RGB lines are permuted. display_draw_565()
+// applies the same table as it unpacks; the helpers below receive a colour
+// directly and permute once.
 static inline void apply_color_order(uint8_t *r, uint8_t *g, uint8_t *b) {
   color_order_t order = nvs_get_color_order();
   if (order >= COLOR_ORDER_MAX || order == COLOR_ORDER_RGB) return;
@@ -409,17 +410,21 @@ static inline void apply_color_order(uint8_t *r, uint8_t *g, uint8_t *b) {
   *b = ch[kChannelOrder[order][2]];
 }
 
-void display_draw(const uint8_t *pix, int width, int height, int channels,
-                  int ixR, int ixG, int ixB) {
+// Draw a 16-bit (RGB565) canvas to the panel.
+//
+// The canvas is 565 rather than 888 because it is the largest buffer the firmware
+// holds for the life of the session and the panel is driven at 5 bits per channel,
+// so the extra byte per pixel bought nothing visible. The channel permutation is
+// applied here as the pixels are unpacked, mirroring the old display_draw()'s
+// index permutation: kChannelOrder[order][n] names the source channel that feeds
+// output channel n.
+void display_draw_565(const uint16_t *pix, int width, int height) {
   if (_matrix == NULL) {
     return;
   }
   color_order_t order = nvs_get_color_order();
   if (order >= COLOR_ORDER_MAX) order = COLOR_ORDER_RGB;
-  const int src[3] = {ixR, ixG, ixB};
-  const int srcR = src[kChannelOrder[order][0]];
-  const int srcG = src[kChannelOrder[order][1]];
-  const int srcB = src[kChannelOrder[order][2]];
+  const uint8_t *map = kChannelOrder[order];
 
   int scale = 1;
 #if CONFIG_BOARD_TRONBYT_S3_WIDE || CONFIG_BOARD_MATRIXPORTAL_S3_WIDE
@@ -428,12 +433,22 @@ void display_draw(const uint8_t *pix, int width, int height, int channels,
   }
 #endif
 
-  for (unsigned int i = 0; i < height; i++) {
-    for (unsigned int j = 0; j < width; j++) {
-      const uint8_t *p = &pix[(i * width + j) * channels];
-      uint8_t r = p[srcR];
-      uint8_t g = p[srcG];
-      uint8_t b = p[srcB];
+  for (int i = 0; i < height; i++) {
+    for (int j = 0; j < width; j++) {
+      const uint16_t p = pix[i * width + j];
+      // 5/6/5 expanded back to 8 bits with the high bits replicated into the low
+      // ones, so the full range is used instead of everything sitting dark.
+      const uint8_t r5 = (uint8_t)((p >> 11) & 0x1F);
+      const uint8_t g6 = (uint8_t)((p >> 5) & 0x3F);
+      const uint8_t b5 = (uint8_t)(p & 0x1F);
+      const uint8_t ch[3] = {
+          (uint8_t)((r5 << 3) | (r5 >> 2)),
+          (uint8_t)((g6 << 2) | (g6 >> 4)),
+          (uint8_t)((b5 << 3) | (b5 >> 2)),
+      };
+      const uint8_t r = ch[map[0]];
+      const uint8_t g = ch[map[1]];
+      const uint8_t b = ch[map[2]];
 
       // Draw each pixel scaled up (2x2 pixels for each original pixel)
       for (int sy = 0; sy < scale; sy++) {

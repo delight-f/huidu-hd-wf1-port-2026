@@ -30,10 +30,11 @@ static const char *TAG = "gfx";
 #define GFX_TASK_PRIO 2
 // The decode path runs libwebp inside this task, and libwebp's recursive
 // Huffman table construction adds to the depth. 4092 left under 1.2 KB spare on
-// the panel's stack watermark, and that reading was taken while decodes were
-// still failing early, so it understates a successful decode. The extra KiB is
-// cheap now that the WiFi code has been moved out of DIRAM.
-#define GFX_TASK_STACK_SIZE 6144
+// the stack watermark, and that reading was taken while decodes were still
+// failing early, so it understates a successful decode - hence the margin. This
+// stack is 4.5 KB of the same heap the decoder itself wants, so it is trimmed
+// against the watermark rather than left generous.
+#define GFX_TASK_STACK_SIZE 4608
 
 struct gfx_state {
   TaskHandle_t task;
@@ -490,8 +491,8 @@ static void gfx_loop(void *args) {
 //
 // Two buffers, both allocated once and reused for every image:
 //
-//   s_canvas  w*h*3  the composited frame, which is what gets pushed to the
-//                    panel (RGB, opaque).
+//   s_canvas  w*h*2  the composited frame, which is what gets pushed to the
+//                    panel (RGB565, opaque).
 //   s_frame   w*h*4  one animation frame decoded to RGBA.
 //
 // Why the canvas and not WebPAnimDecoder: that needs two full canvas buffers
@@ -500,10 +501,10 @@ static void gfx_loop(void *args) {
 //
 // Two ways to fill the canvas, chosen per image:
 //
-//   still (single frame)  decode MODE_RGB straight into the canvas at the
-//                         frame's offset. Cost: the RGB canvas only (6 KB at
-//                         64x32). This is what a Tronbyt server sends most of
-//                         the time, and it is exact.
+//   still (single frame)  decode MODE_RGB_565 straight into the canvas at the
+//                         frame's offset. Cost: the canvas only (4 KB at 64x32).
+//                         This is what a Tronbyt server sends most of the time,
+//                         and it is exact.
 //   animation             decode each frame to RGBA in a scratch and composite
 //                         it, which is what libwebp's own animation decoder
 //                         does - but it needs a second buffer, because libwebp
@@ -557,7 +558,7 @@ void gfx_reserve_decode_buffers(void) {
     return;
   }
 
-  const size_t need = (size_t)w * (size_t)h * 3;
+  const size_t need = (size_t)w * (size_t)h * 2;
   diag_log_heap("canvas reserve: before");
   if (!grow_buffer(&s_canvas, &s_canvas_size, need)) {
     ESP_LOGW(TAG, "could not pre-allocate %u-byte canvas", (unsigned)need);
@@ -716,10 +717,19 @@ static bool is_key_frame(const WebPIterator *cur, const WebPIterator *prev,
           prev_was_key);
 }
 
-// Alpha-composite one decoded RGBA frame onto the RGB canvas at the frame's own
+// Pack for the 16-bit canvas. The composited canvas is RGB565 rather than RGB888:
+// it is the largest buffer held for the life of the session, so two bytes per
+// pixel instead of three is 2 KB back, and 5/6/5 resolves finer than the panel
+// itself can show (it is driven at 5 bits per channel).
+static inline uint16_t rgb_to_565(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint16_t)(((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) |
+                    (uint16_t)(b >> 3));
+}
+
+// Alpha-composite one decoded RGBA frame onto the canvas at the frame's own
 // offset. `blend` mirrors libwebp: only frames after the first, flagged
 // WEBP_MUX_BLEND and not key frames, are blended; everything else replaces.
-static void composite_frame(uint8_t *canvas, int canvas_w, int canvas_h,
+static void composite_frame(uint16_t *canvas, int canvas_w, int canvas_h,
                             const uint8_t *frame, const WebPIterator *it,
                             bool blend) {
   for (int y = 0; y < it->height; y++) {
@@ -729,16 +739,22 @@ static void composite_frame(uint8_t *canvas, int canvas_w, int canvas_h,
       const int cx = it->x_offset + x;
       if (cx < 0 || cx >= canvas_w) continue;
       const uint8_t *src = frame + ((size_t)y * it->width + x) * 4;
-      uint8_t *dst = canvas + ((size_t)cy * canvas_w + cx) * 3;
+      uint16_t *dst = &canvas[(size_t)cy * canvas_w + cx];
       const uint8_t a = src[3];
       if (!blend || a == 255) {
-        dst[0] = src[0];
-        dst[1] = src[1];
-        dst[2] = src[2];
+        *dst = rgb_to_565(src[0], src[1], src[2]);
       } else if (a != 0) {
-        dst[0] = (uint8_t)((src[0] * a + dst[0] * (255 - a)) / 255);
-        dst[1] = (uint8_t)((src[1] * a + dst[1] * (255 - a)) / 255);
-        dst[2] = (uint8_t)((src[2] * a + dst[2] * (255 - a)) / 255);
+        // Unpack the destination to blend against it, then repack. The precision
+        // round-tripped here is below what the panel can display.
+        const uint16_t d = *dst;
+        const uint8_t dr =
+            (uint8_t)((((d >> 11) & 0x1F) << 3) | ((d >> 13) & 0x07));
+        const uint8_t dg =
+            (uint8_t)((((d >> 5) & 0x3F) << 2) | ((d >> 9) & 0x03));
+        const uint8_t db = (uint8_t)(((d & 0x1F) << 3) | ((d >> 2) & 0x07));
+        *dst = rgb_to_565((uint8_t)((src[0] * a + dr * (255 - a)) / 255),
+                          (uint8_t)((src[1] * a + dg * (255 - a)) / 255),
+                          (uint8_t)((src[2] * a + db * (255 - a)) / 255));
       }
     }
   }
@@ -746,7 +762,7 @@ static void composite_frame(uint8_t *canvas, int canvas_w, int canvas_h,
 
 // A frame that disposes to background clears its rectangle from the canvas so
 // the next frame blends against the cleared value.
-static void dispose_frame(uint8_t *canvas, int canvas_w, int canvas_h,
+static void dispose_frame(uint16_t *canvas, int canvas_w, int canvas_h,
                           const WebPIterator *it) {
   if (it->dispose_method != WEBP_MUX_DISPOSE_BACKGROUND) return;
   for (int y = 0; y < it->height; y++) {
@@ -755,7 +771,7 @@ static void dispose_frame(uint8_t *canvas, int canvas_w, int canvas_h,
     for (int x = 0; x < it->width; x++) {
       const int cx = it->x_offset + x;
       if (cx < 0 || cx >= canvas_w) continue;
-      memset(canvas + ((size_t)cy * canvas_w + cx) * 3, 0, 3);
+      canvas[(size_t)cy * canvas_w + cx] = 0;
     }
   }
 }
@@ -770,13 +786,13 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
     return 1;
   }
 
-  const size_t canvas_need = (size_t)w * (size_t)h * 3;
+  const size_t canvas_need = (size_t)w * (size_t)h * 2;
   const size_t frame_need = (size_t)w * (size_t)h * 4;
   if (!grow_buffer(&s_canvas, &s_canvas_size, canvas_need)) {
     ESP_LOGE(TAG, "canvas alloc failed (%u bytes)", (unsigned)canvas_need);
     return 1;
   }
-  uint8_t *const canvas = s_canvas;
+  uint16_t *const canvas = (uint16_t *)s_canvas;
 
   WebPData webpData;
   WebPDataInit(&webpData);
@@ -871,12 +887,15 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
           // where the previous code went wrong: it decoded every frame at the
           // canvas origin with the canvas stride, so any frame smaller than the
           // canvas (which is most animation frames) landed in the wrong place.
-          cfg.output.colorspace = MODE_RGB;
-          cfg.output.u.RGBA.rgba = canvas +
-                                   (size_t)iter.y_offset * (size_t)w * 3 +
-                                   (size_t)iter.x_offset * 3;
-          cfg.output.u.RGBA.stride = w * 3;
-          cfg.output.u.RGBA.size = (size_t)iter.height * (size_t)w * 3;
+          // MODE_RGB_565 writes two bytes per pixel through u.RGBA - libwebp has
+          // no separate 565 union member - which is what makes the 16-bit canvas
+          // worth it: the decoder packs into it directly, with no conversion pass.
+          cfg.output.colorspace = MODE_RGB_565;
+          cfg.output.u.RGBA.rgba =
+              (uint8_t *)canvas +
+              ((size_t)iter.y_offset * (size_t)w + (size_t)iter.x_offset) * 2;
+          cfg.output.u.RGBA.stride = w * 2;
+          cfg.output.u.RGBA.size = (size_t)iter.height * (size_t)w * 2;
         }
         // Hand the reserved runway back for the duration of the decode. libwebp
         // allocates its working buffers inside this call and nothing else
@@ -894,7 +913,7 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
                               iter.blend_method == WEBP_MUX_BLEND && !key);
           dispose_frame(canvas, w, h, &iter);
         }
-        display_draw(canvas, w, h, 3, 0, 1, 2);
+        display_draw_565(canvas, w, h);
         decoded_any = true;
       } else {
         // The status separates "the heap could not give us a contiguous block"

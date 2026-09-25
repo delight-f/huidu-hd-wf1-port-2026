@@ -20,8 +20,7 @@ void display_shutdown(void);
 int display_panel_width(void);
 int display_panel_height(void);
 
-void display_draw(const uint8_t* pix, int width, int height, int channels,
-                  int ixR, int ixG, int ixB);
+void display_draw_565(const uint16_t* pix, int width, int height);
 
 void display_clear(void);
 void display_draw_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b);
