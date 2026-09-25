@@ -75,3 +75,10 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 # not simply window size, and a window the receive path cannot actually back with
 # buffers is a plausible way to make it worse. The base defaults are left alone
 # from here; change one of these only with fetch latency measured either side.
+# lwIP IPv6 off. Nothing here needs it: the image URL is an IPv4 literal, and OTA
+# is impossible on this board anyway (boards/max_app_4mb.csv has a single factory
+# slot), so the only IPv6 consumer left was ota.c's socket family, which now
+# compiles in an IPv4-only form. It is not free to keep - lwIP holds
+# neighbour-discovery state and a structure per address, and this network hands
+# out several SLAAC addresses to the device.
+CONFIG_LWIP_IPV6=n

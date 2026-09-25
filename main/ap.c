@@ -18,7 +18,6 @@
 #include "diag.h"
 #include "mem_compat.h"
 #include "nvs_settings.h"
-#include "panel_sweep.h"
 #include "wifi.h"
 
 #define TAG "AP"
@@ -359,16 +358,14 @@ static esp_err_t diag_handler(httpd_req_t *req) {
       hdr, sizeof(hdr),
       "reset_reason=%d\nfree_heap=%u\nfree_internal=%u\nlargest_internal=%u\n"
       "internal_blocks=%u/%u\nfree_dma=%u\nlargest_dma=%u\nbrightness=%u\n"
-      "btn_gpio%d=%d\n"
-      "btn_gpio0=%d\n--- boot heap trace ---\n",
+      "--- boot heap trace ---\n",
       (int)esp_reset_reason(), (unsigned)esp_get_free_heap_size(),
       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
       (unsigned)int_info.free_blocks, (unsigned)int_info.total_blocks,
       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
-      (unsigned)nvs_get_brightness(), (int)CONFIG_BUTTON_PIN,
-      panel_sweep_button_level(), panel_sweep_gpio0_level());
+      (unsigned)nvs_get_brightness());
 
   httpd_resp_set_type(req, "text/plain");
   httpd_resp_send_chunk(req, hdr, hdr_len);

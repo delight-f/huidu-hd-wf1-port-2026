@@ -76,25 +76,6 @@ static void display_text_fitted(const char *text, int x, int y, uint8_t r,
   display_text(buf, x, y, r, g, b, 1);
 }
 
-// TEMP BENCH DIAGNOSTIC: render decode state on the panel. The text renderer
-// works even when the WebP path does not, so this is how we read state on a
-// board with no usable console. `tag` names the stage, `ok` the outcome.
-static void diag_panel(const char *tag, size_t len, bool ok) {
-  char a[32], b[32], c[32], d[32];
-  snprintf(a, sizeof(a), "stk %u",
-           (unsigned)uxTaskGetStackHighWaterMark(NULL));
-  snprintf(b, sizeof(b), "webp %u", (unsigned)len);
-  snprintf(c, sizeof(c), "%s %s", tag, ok ? "OK" : "ERR");
-  // Total free heap is not the number that decides whether a decode fits: the
-  // decoder needs one large *contiguous* block, so report the largest free
-  // block too. 'h' = free heap, 'b' = largest free block, both in KiB.
-  snprintf(d, sizeof(d), "h%uk b%uk",
-           (unsigned)(esp_get_free_heap_size() / 1024),
-           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT) /
-                      1024));
-  display_diag_show(a, b, c, d);
-}
-
 int gfx_initialize(const char *img_url) {
   // Only initialize once
   if (_state) {
@@ -586,6 +567,87 @@ void gfx_reserve_decode_buffers(void) {
   diag_log_heap("canvas reserve: after");
 }
 
+// A reserved runway for the decoder's own allocations.
+//
+// libwebp needs ~21.3 KB live at once for a 64x32 lossless frame - measured with
+// the host harness as an 11,816-byte buffer plus a ~9,504-byte one - and both have
+// to come out of *contiguous* free space. On this board the largest free run
+// swings between roughly 19 KB and 30 KB as tasks and buffers come and go, so the
+// same image decodes or fails depending only on heap luck.
+//
+// Holding a block of this size keeps that region from being broken up by
+// everything that allocates while an image is in flight, and handing it back for
+// the duration of the decode gives libwebp one clean run to allocate in.
+//
+// It is deliberately NOT taken before WiFi. An earlier attempt to reserve decoder
+// space that early stopped the station associating at all - the join needs a large
+// contiguous allocation of its own - which is why this waits until the link is up
+// and the display is initialised, where the boot trace shows 32-38 KB free in one
+// run.
+//
+// DISABLED, and the reason is worth keeping. Holding this much for the life of the
+// session starves the receive path: the fetch grows its buffer to 6-8 KB in one
+// piece while the arena and the composite scratch are held, and with the arena
+// reserved the largest free run fell to ~4 KB - so the board could no longer
+// receive a 4 KB image at all. That is worse than the intermittent decode failure
+// it fixes: a fetch that cannot complete shows nothing, where a decode that cannot
+// fit falls back to drawing frames unblended. The mechanism does work for the
+// decode; what does not fit is a ~22 KB reservation, an 8 KB scratch and the
+// receive buffer occupying this chip at the same time. Re-enable it only alongside
+// enough freed memory that those three stop competing - see the budget notes in
+// sdkconfig.defaults.huidu-wf1.
+#define GFX_DECODE_ARENA_ENABLED 0
+#define GFX_DECODE_ARENA (22 * 1024)
+
+static uint8_t *s_arena = NULL;
+static bool s_arena_wanted = false;
+
+void gfx_reserve_decode_arena(void) {
+#if !GFX_DECODE_ARENA_ENABLED
+  return;
+#endif
+  if (s_arena != NULL || s_arena_wanted) {
+    return;
+  }
+  diag_log_heap("arena: before");
+  s_arena = malloc(GFX_DECODE_ARENA);
+  if (s_arena == NULL) {
+    // No worse than before: the decode just goes back to depending on the shape
+    // of the heap. Do not set s_arena_wanted, so nothing juggles a block that was
+    // never obtained.
+    ESP_LOGW(TAG, "could not reserve %u-byte decode arena", (unsigned)GFX_DECODE_ARENA);
+  } else {
+    s_arena_wanted = true;
+    ESP_LOGI(TAG, "reserved %u-byte decode arena", (unsigned)GFX_DECODE_ARENA);
+  }
+  diag_log_heap("arena: after");
+}
+
+// Hand the runway back for the duration of one decode, then take it again. Freed,
+// it merges with whatever is adjacent, so the decoder sees the largest run this
+// heap can offer rather than the broken-up shape it would otherwise get. If
+// another task claims it in the gap the decode simply behaves as it did before the
+// arena existed, so that is reported once rather than on every frame.
+static void arena_give(void) {
+  if (!s_arena_wanted || s_arena == NULL) {
+    return;
+  }
+  free(s_arena);
+  s_arena = NULL;
+}
+
+static void arena_take(void) {
+  static bool warned = false;
+  if (!s_arena_wanted || s_arena != NULL) {
+    return;
+  }
+  s_arena = malloc(GFX_DECODE_ARENA);
+  if (s_arena == NULL && !warned) {
+    warned = true;
+    ESP_LOGW(TAG, "decode arena lost to another task; decoding without it");
+  }
+}
+
 // Release the composite scratch.
 //
 // This buffer is a cache, not a fixture. It is only useful to frame sequences
@@ -705,7 +767,6 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
   int w = 0, h = 0;
   if (!WebPGetInfo(buf, len, &w, &h) || w <= 0 || h <= 0) {
     ESP_LOGE(TAG, "WebPGetInfo failed");
-    diag_panel("info", len, false);
     return 1;
   }
 
@@ -713,7 +774,6 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
   const size_t frame_need = (size_t)w * (size_t)h * 4;
   if (!grow_buffer(&s_canvas, &s_canvas_size, canvas_need)) {
     ESP_LOGE(TAG, "canvas alloc failed (%u bytes)", (unsigned)canvas_need);
-    diag_panel("buf", len, false);
     return 1;
   }
   uint8_t *const canvas = s_canvas;
@@ -741,7 +801,6 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
       ESP_LOGE(TAG, "WebPDemux failed: len=%u too short for a container",
                (unsigned)len);
     }
-    diag_panel("dmux", len, false);
     return 1;
   }
 
@@ -751,7 +810,17 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
   bool composite = false;
   if (WebPDemuxGetI(demux, WEBP_FF_FRAME_COUNT) > 1) {
     const size_t free_now = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-    if (free_now >= frame_need + GFX_DECODE_HEADROOM &&
+    // GFX_DECODE_HEADROOM exists to stop the scratch from consuming the run
+    // libwebp is about to need. With the arena reserved that run is already held
+    // back, and at decode time the decoder takes it from the arena whatever the
+    // scratch has done - so demanding the margin here does not protect anything,
+    // it only guarantees that composites never happen. That is not a neutral
+    // failure: an unblended partial frame is what a missing-pixels animation
+    // looks like, and because the gate used to sit right on the boundary of a
+    // fluctuating heap, the same image would composite on one redraw and not the
+    // next, which is what made it flicker.
+    const size_t reserve = s_arena_wanted ? 0 : GFX_DECODE_HEADROOM;
+    if (free_now >= frame_need + reserve &&
         grow_buffer(&s_frame, &s_frame_size, frame_need)) {
       composite = true;
     } else {
@@ -809,7 +878,12 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
           cfg.output.u.RGBA.stride = w * 3;
           cfg.output.u.RGBA.size = (size_t)iter.height * (size_t)w * 3;
         }
+        // Hand the reserved runway back for the duration of the decode. libwebp
+        // allocates its working buffers inside this call and nothing else
+        // allocates here, so it gets the run the arena was holding.
+        arena_give();
         status = WebPDecode(iter.fragment.bytes, iter.fragment.size, &cfg);
+        arena_take();
         ok = status == VP8_STATUS_OK;
       }
 
@@ -856,10 +930,7 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
   WebPDemuxDelete(demux);
 
   if (!decoded_any && failed_any) {
-    // Nothing rendered, so the panel is free to carry the diagnostic instead.
-    // On success we deliberately do not touch it: the picture is the output.
     draw_error_indicator_pixel();
-    diag_panel("dec", len, false);
     return 1;
   }
 

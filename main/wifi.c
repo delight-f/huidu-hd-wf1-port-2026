@@ -301,10 +301,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         // Sending an RS triggers an RA containing RDNSS IPv6 addresses;
         // ESP-IDF stores those in dns[0], overwriting the DHCP IPv4 DNS
         // and causing getaddrinfo() to fail at boot.
+#if LWIP_IPV6
         if (nvs_get_prefer_ipv6()) {
           ESP_LOGI(TAG, "Connected to AP, creating IPv6 link local address");
           esp_netif_create_ip6_linklocal(s_sta_netif);
         }
+#endif
         break;
       case WIFI_EVENT_STA_DISCONNECTED:
         // Increment reconnection counter
@@ -351,6 +353,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
         handle_successful_ip_acquisition();
       } break;
+#if LWIP_IPV6
       case IP_EVENT_GOT_IP6: {
         ip_event_got_ip6_t* event = (ip_event_got_ip6_t*)event_data;
         ip6_addr_t* addr = (ip6_addr_t*)&event->ip6_info.ip;
@@ -365,6 +368,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
           ESP_LOGI(TAG, "IPv6 address is not global, waiting...");
         }
       } break;
+#endif
       default:
         break;
     }

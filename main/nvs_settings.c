@@ -334,7 +334,15 @@ bool nvs_get_skip_boot_animation(void) { return s_skip_boot_animation; }
 
 bool nvs_get_ap_mode(void) { return s_ap_mode; }
 
-bool nvs_get_prefer_ipv6(void) { return s_prefer_ipv6; }
+bool nvs_get_prefer_ipv6(void) {
+#if !CONFIG_LWIP_IPV6
+  // lwIP is built without IPv6 on this target, so the preference cannot be
+  // honoured; report it off so nothing waits for an address that never arrives.
+  return false;
+#else
+  return s_prefer_ipv6;
+#endif
+}
 
 bool nvs_get_disable_touch(void) { return s_disable_touch; }
 

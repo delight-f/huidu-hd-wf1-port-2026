@@ -13,6 +13,11 @@ int gfx_initialize(const char* img_url);
 // it lands.
 void gfx_reserve_decode_buffers(void);
 
+// Reserve the decoder's working runway. Call once the station link is up and the
+// display is initialised - not before, or the WiFi join loses the large
+// contiguous allocation it needs. See the comment in gfx.c.
+void gfx_reserve_decode_arena(void);
+
 void gfx_set_websocket_handle(esp_websocket_client_handle_t ws_handle);
 int gfx_update(void* webp, size_t len, int32_t dwell_secs);
 int gfx_get_loaded_counter(void);

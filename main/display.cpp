@@ -10,7 +10,6 @@
 
 #include "font5x7.h"
 #include "nvs_settings.h"
-#include "panel_sweep.h"
 #if CONFIG_BOARD_TIDBYT_GEN2
 #define R1 5
 #define G1 23
@@ -340,36 +339,6 @@ int display_initialize(void) {
     return 1;
   }
 
-#if CONFIG_BOARD_HUIDU_WF1
-  // TEMP BENCH DIAGNOSTIC (remove once the panel configuration is settled).
-  // Solid fills prove the panel is driven end-to-end: a full-screen fill is
-  // invariant under row/timing errors, so it cannot validate the scan path, but
-  // it does confirm the pins, OE/LAT/CLK and colour order. The final colour is
-  // the active panel-sweep config (see panel_sweep.c / the GPIO11 button).
-  _matrix->setBrightness8(255);
-  _matrix->fillScreenRGB888(255, 0, 0);
-  vTaskDelay(pdMS_TO_TICKS(500));
-  _matrix->fillScreenRGB888(0, 255, 0);
-  vTaskDelay(pdMS_TO_TICKS(500));
-  _matrix->fillScreenRGB888(0, 0, 255);
-  vTaskDelay(pdMS_TO_TICKS(500));
-
-  // TEMP BENCH DIAGNOSTIC: print the boot numbers on the panel. Text renders
-  // correctly even when the WebP path does not, so this is the reliable way to
-  // read state on a board with no usable console.
-  char d1[16], d2[16], d3[16], d4[16];
-  snprintf(d1, sizeof(d1), "heap %uk",
-           (unsigned)(esp_get_free_heap_size() / 1024));
-  snprintf(d2, sizeof(d2), "int %uk",
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
-  snprintf(d3, sizeof(d3), "dma %uk",
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024));
-  snprintf(d4, sizeof(d4), "cfg %d %d %d", drv, line, latch);
-  display_diag_show(d1, d2, d3, d4);
-  vTaskDelay(pdMS_TO_TICKS(5000));
-  _matrix->clearScreen();
-#endif
-
   // Apply stored brightness immediately so reboots (especially at night with
   // brightness 0) don't flash the boot animation at full brightness.
   uint8_t brightness_pct = nvs_get_brightness();
@@ -481,40 +450,6 @@ void display_clear(void) {
   if (_matrix != NULL) {
     _matrix->clearScreen();
   }
-}
-
-// Uses the library's own full-screen fill rather than per-pixel writes: a
-// uniform fill is the one thing that renders correctly on this board even when
-// the scan path is mis-configured, so it is the reliable boot indicator.
-void display_fill_screen(uint8_t r, uint8_t g, uint8_t b) {
-  if (_matrix != NULL) {
-    _matrix->fillScreenRGB888(r, g, b);
-  }
-}
-
-void display_diag_show(const char *l1, const char *l2, const char *l3,
-                       const char *l4) {
-  if (_matrix == NULL) {
-    return;
-  }
-  _matrix->clearScreen();
-
-  const char *lines[4] = {l1, l2, l3, l4};
-  for (int i = 0; i < 4; i++) {
-    if (lines[i] == NULL) {
-      continue;
-    }
-    // 64 px wide, 6 px per glyph: 10 characters per line.
-    char buf[11];
-    size_t n = strlen(lines[i]);
-    if (n > 10) {
-      n = 10;
-    }
-    memcpy(buf, lines[i], n);
-    buf[n] = '\0';
-    display_text(buf, 0, i * 8, 255, 255, 255, 1);
-  }
-  display_flip();
 }
 
 void display_draw_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {

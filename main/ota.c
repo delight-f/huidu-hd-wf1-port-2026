@@ -27,7 +27,9 @@ static bool is_ip_private(const struct sockaddr *addr) {
            ((ip >> 20) == 0xAC1) ||   // 172.16.0.0/12
            ((ip >> 16) == 0xC0A8) ||  // 192.168.0.0/16
            (ip >> 24 == 127);         // 127.0.0.0/8
-  } else if (addr->sa_family == AF_INET6) {
+  }
+#if LWIP_IPV6
+  else if (addr->sa_family == AF_INET6) {
     struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
     // fc00::/7 (Unique Local Addresses)
     if ((sin6->sin6_addr.s6_addr[0] & 0xFE) == 0xFC) return true;
@@ -36,6 +38,7 @@ static bool is_ip_private(const struct sockaddr *addr) {
     // ::1 (Loopback)
     if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr)) return true;
   }
+#endif
   return false;
 }
 
@@ -100,10 +103,17 @@ static bool resolve_and_validate_host(const char *url,
       if (p->ai_family == AF_INET) {
         addr_ptr = &((struct sockaddr_in *)p->ai_addr)->sin_addr;
         *is_ipv6 = false;
+#if LWIP_IPV6
       } else {
         addr_ptr = &((struct sockaddr_in6 *)p->ai_addr)->sin6_addr;
         *is_ipv6 = true;
+#else
+      } else {
+        // IPv6 is compiled out, so getaddrinfo cannot return this family - but
+        // saying so keeps addr_ptr provably initialised for the compiler.
+        continue;
       }
+#endif
       if (inet_ntop(p->ai_family, addr_ptr, ip_str, ip_str_len) != NULL) {
         private_ip = true;
         break;
@@ -145,9 +155,15 @@ static bool reconstruct_url(const char *url, const struct http_parser_url *u,
                     url + u->field_data[UF_USERINFO].off);
   }
 
+#if LWIP_IPV6
   if (is_ipv6) {
     APPEND_URL_PART("[%s]", ip_str);
   } else {
+#else
+  // lwIP is built without IPv6 here, so a host can only be an IPv4 literal.
+  (void)is_ipv6;
+  {
+#endif
     APPEND_URL_PART("%s", ip_str);
   }
 
@@ -204,7 +220,12 @@ static bool validate_and_rewrite_url(const char *url, char *out_url,
   }
 
   // It is HTTP. Resolve and validate host.
+#if LWIP_IPV6
   char ip_str[INET6_ADDRSTRLEN];
+#else
+  // lwIP is built without IPv6 here, so a host can only resolve to an IPv4 address.
+  char ip_str[INET_ADDRSTRLEN];
+#endif
   bool is_ipv6;
   if (!resolve_and_validate_host(url, &u, ip_str, sizeof(ip_str), &is_ipv6)) {
     return false;

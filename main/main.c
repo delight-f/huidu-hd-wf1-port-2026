@@ -20,7 +20,6 @@
 #include "mem_compat.h"
 #include "nvs_settings.h"
 #include "ota.h"
-#include "panel_sweep.h"
 #include "remote.h"
 #include "sdkconfig.h"
 #include "sntp.h"
@@ -534,11 +533,6 @@ void app_main(void) {
                                  .intr_type = GPIO_INTR_DISABLE};
   gpio_config(&button_config);
 
-#if CONFIG_BOARD_HUIDU_WF1
-  // Bench bring-up: GPIO11 button steps through candidate panel configs.
-  panel_sweep_start();
-#endif
-
   // Check if button is pressed (active low with pull-up)
   button_boot = (gpio_get_level(CONFIG_BUTTON_PIN) == 0);
 
@@ -638,6 +632,12 @@ void app_main(void) {
 
   if (sta_connected) {
     ESP_LOGI(TAG, "WiFi connected successfully!");
+
+    // Claim the decoder's runway now that the link is up and the display is
+    // initialised - it is what keeps libwebp's two working buffers adjacent
+    // instead of depending on how the heap happens to be shaped. Deliberately
+    // here rather than before WiFi; see gfx_reserve_decode_arena().
+    gfx_reserve_decode_arena();
 
     if (nvs_get_prefer_ipv6()) {
       ESP_LOGI(TAG, "IPv6 preference enabled, waiting for global address...");
