@@ -14,7 +14,7 @@ The port works: it boots, joins WiFi, fetches from the Tronbyt server and puts p
 | Board | Runs for many minutes with `reset_reason=1`; the old ~1-minute reset has not reproduced recently and is **not explained** |
 | Fetching | Works, IPv4 only, 29–326 ms typical. A 30 s timeout has been seen when the server was busy rendering |
 | Stills | Decode and display |
-| Animations | Decode **conditionally**. Often render partially, or without blending |
+| Animations | Small ones (218–538 B) decode, composite and display. A heavier ~13 KB animated app still fails its **second** frame — see §3 and §6 |
 | Bench scaffolding | Removed (cycler, boot fills, on-panel readout). `/diag` and `/panel` remain |
 | Decode arena | Implemented, **deliberately disabled** — see §5 |
 | Depth / stacks / WiFi RX | Trimmed to 5-bit BCM, main 5120, gfx 4608, static RX 10 |
@@ -98,6 +98,9 @@ cp build/firmware.elf artifacts/$(date +%Y%m%d)-<what>.elf
 - **The dwell was being ignored.** The main loop never waited, so the board polled ~1.2 images/second against a `Tronbyt-Dwell-Secs: 10`. Fixed by sleeping only the remainder.
 - **The server serves 64×32**, 3-frame animations at 268–1,316 B for this device; larger apps are 20–33 KB and are refused at the 16 KB ceiling. Its config lists this device as `type: "other"` with an **empty `info`** block, because `client_info` is only ever sent over WebSocket and this device polls HTTP.
 - **Small frames fail more readily than big ones.** Frame 1 is full-canvas; frame 2 is often an 18×22 patch — and it is frame 2 that OOMs, because the heap is more chopped after the first decode, not less.
+- **After the depth/canvas/stack/RX trims, verified on device:** boot heap after `ap_start` is **56,216 / 47,104** (was 41,084 / 32,768), so **+15.1 KB free and +14.3 KB of largest** at boot; `firmware.bin` is 1,258,096 B; and over a 2-minute sample all 18 reads showed `reset_reason=1`, so no resets. Small animations now composite and display with no warning.
+- **It is still not enough, and now the reason is specific.** At decode time the heap shows 33–42 KB *free* but only **14,336–18,432 B contiguous**, because `gfx.c` deliberately **keeps the previous image resident so its animation can loop** (*"keep webp around to loop until the next image arrives"*, `gfx_loop()`) while `main.c` receives the next payload. libwebp wants ~21.3 KB contiguous. So `frame 2 decode failed (out of memory)` persists for the ~13 KB app, and the compositing gate — which needs 38,912 B free — is still refused at 32,916–37,656.
+- **That makes the next fix structural, not another KB trim.** Total free is no longer the binding constraint; the coexistence of the retained image and the incoming payload is. Releasing the retained bytes for the duration of a fetch is the promising move, and it should be invisible: the HUB75 driver holds its own framebuffer, so the panel keeps showing the last drawn frame while an animation's loop is paused. Confirm the panel really does hold that frame before relying on it.
 
 ---
 
@@ -133,11 +136,12 @@ It is kept in `gfx.c` behind `GFX_DECODE_ARENA_ENABLED 0` with the full reasonin
 
 ## 6. What I would do next, in order
 
-1. **Confirm the current memory trims landed** — read `largest_internal` and `free_heap` off `/diag` and compare with §3. If `largest_internal` is not reliably above ~21,320, compositing will keep being refused and the wrong pixels will keep coming back.
-2. **Then decide the animation question deliberately**, because it is a trade, not a bug: (a) keep the full 16 KB ceiling and accept partial/unblended animations; (b) lower the ceiling to ~8 KB so the payload term shrinks and both compositing and the later frames fit; or (c) fix asset sizes at the server, which is where the oversized cases belong.
-3. **Only then re-open the arena**, with the numbers from step 1 deciding its size.
-4. **Measure the gfx task's stack watermark on a *successful* decode.** It was trimmed to 4,608 on a reading taken while decodes were failing, which understates the real peak. If it is tight, that shows up as a reset, and you will be back to §7.
-5. **Keep the ELF before every flash.**
+1. **The trims landed — confirmed on device.** Boot heap after `ap_start` is 56,216 / 47,104, `firmware.bin` is 1,258,096 B, and the board is stable across minutes. See §3.
+2. **The open problem is no longer total memory; it is coexistence.** At decode time free is 33–42 KB but the largest contiguous run is only 14,336–18,432 B, because the previous image is retained so its animation can loop while the next payload arrives. Freeing those retained bytes for the duration of a fetch is the move — the panel should keep displaying its last drawn frame while the loop is paused, but **verify that on the panel first** (§3, last bullet).
+3. **Only then re-open the arena**, sized by the numbers above. Remember it was parked for starving the *receive* path, so any give/take design has to leave a fetch its 6–8 KB.
+4. **Treat the payload ceiling as a last resort.** Dropping it to ~8 KB shrinks the payload term but refuses more apps, and the server is where oversized assets genuinely belong.
+5. **Measure the gfx task's stack watermark on a *successful* decode.** It was trimmed to 4,608 on a reading taken while decodes were failing, which understates the real peak. If it is tight, that shows up as a reset, and you are back in §7.
+6. **Keep the ELF before every flash.**
 
 ---
 
