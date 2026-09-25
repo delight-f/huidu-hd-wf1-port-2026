@@ -6,7 +6,9 @@
 
 static long g_cur = 0;
 static long g_peak = 0;
+static long g_largest = 0;
 static int g_trace = 0;
+static long g_req = 0;  // size the caller actually asked for, not the usable size
 
 void memtrack_trace(int on) { g_trace = on; }
 
@@ -20,14 +22,16 @@ static void acc(void *p) {
     long sz = (long)malloc_usable_size(p);
     g_cur += sz;
     if (g_cur > g_peak) g_peak = g_cur;
-    if (g_trace) fprintf(stderr, "    +%6ld -> live %6ld\n", sz, g_cur);
+    if (sz > g_largest) g_largest = sz;
+    if (g_trace) fprintf(stderr, "    +%6ld (req %6ld) -> live %6ld\n", sz, g_req, g_cur);
   }
 }
 
-void *__wrap_malloc(size_t n) { void *p = __real_malloc(n); acc(p); return p; }
-void *__wrap_calloc(size_t a, size_t b) { void *p = __real_calloc(a, b); acc(p); return p; }
+void *__wrap_malloc(size_t n) { g_req = (long)n; void *p = __real_malloc(n); acc(p); return p; }
+void *__wrap_calloc(size_t a, size_t b) { g_req = (long)(a * b); void *p = __real_calloc(a, b); acc(p); return p; }
 void *__wrap_realloc(void *q, size_t n) {
   if (q) g_cur -= (long)malloc_usable_size(q);
+  g_req = (long)n;
   void *p = __real_realloc(q, n); acc(p); return p;
 }
 void __wrap_free(void *p) {
@@ -39,6 +43,11 @@ void __wrap_free(void *p) {
   __real_free(p);
 }
 
-void memtrack_reset(void) { g_peak = g_cur; }
+void memtrack_reset(void) { g_peak = g_cur; g_largest = 0; }
 long memtrack_peak(void) { return g_peak - g_cur; }
 long memtrack_cur(void) { return g_cur; }
+// Largest single allocation seen since the reset. This is the number that
+// actually decides whether a decode fits on the board: the peak can be well
+// under the free heap and the decode still fail, if the biggest single
+// allocation has no free block big enough to land in.
+long memtrack_largest(void) { return g_largest; }

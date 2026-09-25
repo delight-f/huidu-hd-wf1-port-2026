@@ -305,6 +305,19 @@ int display_initialize(void) {
            "double_buff=%d",
            drv, line, spd, latch, ph, dbfr);
 
+  // Panel colour depth, in bits per channel. The driver's framebuffer is one
+  // uint16_t per pixel per bit per row, so 8 bits costs 16,384 bytes and 6 costs
+  // 12,288 - all of it internal DMA-capable RAM, which is the same pool
+  // libwebp's internal decode buffer must come from. This is a memory knob: 8 is
+  // not affordable on a no-PSRAM S2 alongside the decoder, and at 8 the largest
+  // free run drops far enough that frames stop decoding.
+  //
+  // Note this also shifts the BCM bitplane timing (nsPerRow scales with depth),
+  // so it is a panel-behaviour change, not only a size change - judge it on the
+  // panel, and remember the panel shows collapsed rows after a flash until it
+  // has been power-cycled (HANDOFF.md section 6).
+  constexpr uint8_t kPanelColorDepthBits = 6;
+
   HUB75_I2S_CFG mxconfig(
       WIDTH, HEIGHT, 1, pins,
       (HUB75_I2S_CFG::shift_driver)drv,  // driver chip
@@ -312,7 +325,10 @@ int display_initialize(void) {
       dbfr != 0,                         // double-buffering
       spd ? HUB75_I2S_CFG::HZ_20M : HUB75_I2S_CFG::HZ_10M,  // clock speed
       (uint8_t)latch,                                        // latch blanking
-      ph != 0                                                // invert clock phase
+      ph != 0,                                               // invert clock phase
+      60,  // minimum refresh rate; the library default, passed only to reach
+           // the colour depth argument
+      kPanelColorDepthBits
   );
 
   _matrix = new MatrixPanel_I2S_DMA(mxconfig);
@@ -363,6 +379,10 @@ int display_initialize(void) {
 
   return 0;
 }
+
+int display_panel_width(void) { return WIDTH; }
+
+int display_panel_height(void) { return HEIGHT; }
 
 void display_set_brightness(uint8_t brightness_pct) {
   if (brightness_pct > DISPLAY_MAX_BRIGHTNESS) {

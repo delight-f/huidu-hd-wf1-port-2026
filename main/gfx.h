@@ -4,6 +4,15 @@
 #include <stddef.h>
 
 int gfx_initialize(const char* img_url);
+
+// Pre-allocate the decode canvas, sized from the panel geometry. Called from
+// app_main *before* wifi_initialize() so the buffer lands early in the heap
+// instead of splitting the largest free run once WiFi, the HTTP server and
+// every task stack are already up. Cheap and safe: the canvas is allocated once
+// and held for the life of the program either way, so this only changes where
+// it lands.
+void gfx_reserve_decode_buffers(void);
+
 void gfx_set_websocket_handle(esp_websocket_client_handle_t ws_handle);
 int gfx_update(void* webp, size_t len, int32_t dwell_secs);
 int gfx_get_loaded_counter(void);

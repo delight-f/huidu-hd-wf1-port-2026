@@ -11,6 +11,8 @@
 
 void memtrack_reset(void);
 long memtrack_peak(void);
+long memtrack_largest(void);
+void memtrack_trace(int on);
 
 static uint8_t *readfile(const char *p, size_t *n) {
   FILE *f = fopen(p, "rb");
@@ -51,11 +53,14 @@ static void measure(const char *label, const uint8_t *frag, size_t frag_len,
     cfg.options.scaled_width = sw;
     cfg.options.scaled_height = sh;
   }
+  if (getenv("MEMTRACK_TRACE")) memtrack_trace(1);
   memtrack_reset();
   VP8StatusCode s = WebPDecode(frag, frag_len, &cfg);
   long peak = memtrack_peak();
-  printf("  %-38s %-14s peak %6ld B\n", label,
-         s == VP8_STATUS_OK ? "OK" : "FAIL", peak);
+  long largest = memtrack_largest();
+  memtrack_trace(0);
+  printf("  %-38s %-14s peak %6ld B   largest single %6ld B\n", label,
+         s == VP8_STATUS_OK ? "OK" : "FAIL", peak, largest);
   free(out);
 }
 

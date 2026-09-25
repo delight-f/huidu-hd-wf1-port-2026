@@ -4,7 +4,9 @@
 #include <esp_log.h>
 #include <esp_netif.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <esp_tls.h>
+#include <esp_wifi.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,12 +25,17 @@ struct remote_state {
   size_t len;
   size_t size;
   size_t max;
+  size_t expected;  // Content-Length, 0 if the response did not announce one
   int16_t brightness;
   int32_t dwell_secs;
   char* ota_url;
   char* image_url;
   bool reboot_requested;
   bool oversize_detected;
+  bool connected;  // did the TCP connection to the server ever come up?
+  bool buf_lost;   // receive buffer was freed mid-transfer; body is unusable
+  size_t logged_to;   // progress-log high-water mark, to keep the ring readable
+  int64_t started_us; // when perform() began, for per-chunk timing
 };
 
 static bool parse_header_bool(const char* value) {
@@ -53,6 +60,7 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
 
     case HTTP_EVENT_ON_CONNECTED:
       ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
+      state->connected = true;
       break;
 
     case HTTP_EVENT_HEADER_SENT:
@@ -79,6 +87,41 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
           esp_http_client_close(event->client);  // Abort the HTTP request
         } else {
           ESP_LOGI(TAG, "Content-Length Header : %d", content_length);
+          state->expected = content_length;
+
+          // Match the receive buffer to the payload. This buffer is handed to
+          // gfx and stays live for the whole decode, so an oversized one is not
+          // merely wasted heap: it is an allocation sitting in the middle of the
+          // free space at the exact moment libwebp needs one contiguous block.
+          // Tronbyt images here are 226-360 bytes, so the 4 KB default was
+          // spending most of a decode's worth of fragmentation on nothing.
+          //
+          // Sized once, here, in both directions. Doing it in the header rather
+          // than letting the body's overflow path grow it means the body needs
+          // no reallocation at all - and a resize that happens before the
+          // payload has been buffered can draw on the whole heap instead of one
+          // already holding most of the image. Growing here also matters: a
+          // shrunk buffer that is left to grow mid-body has to be reached
+          // through the very fragmentation this is trying to avoid.
+          if (content_length > 0 && content_length != state->size) {
+            void* resized =
+                heap_caps_realloc(state->buf, content_length, IMAGE_BUF_CAPS);
+            if (resized != NULL) {
+              state->buf = resized;
+              state->size = content_length;
+            } else {
+              // Keep the buffer we have. The body's overflow path can still
+              // grow it, and a too-small buffer is recoverable where a NULL one
+              // is not.
+              ESP_LOGW(TAG,
+                       "Could not right-size response buffer to %d bytes "
+                       "(free %u largest %u)",
+                       content_length,
+                       (unsigned)heap_caps_get_free_size(IMAGE_BUF_CAPS),
+                       (unsigned)heap_caps_get_largest_free_block(
+                           IMAGE_BUF_CAPS));
+            }
+          }
         }
       }
 
@@ -135,10 +178,9 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
 
       // If needed, resize the buffer to fit the new data
       if (event->data_len + state->len > state->size) {
-        // Determine new size
-        state->size =
-            MAX(MIN(state->size * 2, state->max), state->len + event->data_len);
-        if (state->size > state->max) {
+        const size_t need = state->len + event->data_len;
+
+        if (need > state->max) {
           ESP_LOGE(TAG, "Response size exceeds allowed max (%d bytes)",
                    state->max);
           // Display the oversize graphic
@@ -153,13 +195,30 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
           break;
         }
 
+        // Grow to what this response actually needs, rather than doubling.
+        // Doubling overshoots what this heap can serve: a 15,658-byte image asks
+        // for 32,000 bytes, while the largest free block runs around 17 KB - so
+        // the fetch fails on a request twice the size of the one it needs, and
+        // the image never arrives to be decoded. Rounded up to a KiB so that a
+        // body arriving in many segments does not reallocate on every one.
+        state->size = (need + 1023) & ~(size_t)1023;
+        if (state->size > state->max) {
+          state->size = state->max;
+        }
+
         // And reallocate
         void* new =
             heap_caps_realloc(state->buf, state->size, IMAGE_BUF_CAPS);
         if (new == NULL) {
-          ESP_LOGE(TAG, "Resizing response buffer failed");
+          ESP_LOGE(TAG,
+                   "Resizing response buffer to %u bytes failed (free %u "
+                   "largest %u)",
+                   (unsigned)state->size,
+                   (unsigned)heap_caps_get_free_size(IMAGE_BUF_CAPS),
+                   (unsigned)heap_caps_get_largest_free_block(IMAGE_BUF_CAPS));
           free(state->buf);
           state->buf = NULL;
+          state->buf_lost = true;
           err = ESP_ERR_NO_MEM;
           break;
         }
@@ -169,6 +228,21 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
       // Copy over the new data
       memcpy(state->buf + state->len, event->data, event->data_len);
       state->len += event->data_len;
+
+      // Progress through the body, sparsely (the log ring holds ~20 lines, so
+      // this is one line per 4 KB). A transfer that trickles slowly and one
+      // that stops dead look identical from outside - both surface as "short
+      // payload" after tens of seconds - but they have opposite causes: a slow
+      // reader (this task starved of CPU by the panel's DMA refresh) versus a
+      // receive path that has run out of buffers and simply never opens the
+      // window again. Chunk sizes and the gaps between them separate the two.
+      if (state->len >= state->logged_to + 4096) {
+        ESP_LOGI(TAG, "  body %u bytes at +%d ms (last chunk %u)", 
+                 (unsigned)state->len,
+                 (int)((esp_timer_get_time() - state->started_us) / 1000),
+                 (unsigned)event->data_len);
+        state->logged_to = state->len;
+      }
       break;
 
     case HTTP_EVENT_ON_FINISH:
@@ -194,6 +268,36 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
   }
 
   return err;
+}
+
+// Is this the whole file, according to the file itself?
+//
+// The server streams multi-KB animated WebPs, and when our read stalls it closes
+// the connection early and we are left holding a prefix of the image. The
+// client reports success, because from its side the connection ended cleanly, and
+// the payload's header is intact - so every naive check passes and the decoder is
+// handed a truncated file. WebPGetInfo succeeds on that header and WebPDemux then
+// fails, which surfaces on the panel as a decoder error with the heap sitting
+// idle: a transfer fault that reads as anything but one.
+//
+// The RIFF size field at offset 4 is the authority on how long the file is, so
+// compare it against what we actually hold. This catches the truncation at the
+// point it happens, where the cause is legible.
+static size_t payload_declared_size(const void *buf, size_t len) {
+  // A NULL buffer means "we have no payload", not "a payload of length len". The
+  // receive buffer is freed on a failed resize while state.len still holds the
+  // bytes accumulated so far, so this combination is reachable - and treating it
+  // as readable data panics the board with a LoadProhibited at the memcmp below.
+  // Found exactly that way, from the coredump.
+  if (buf == NULL || len < 12) {
+    return 0;
+  }
+  const uint8_t *p = (const uint8_t *)buf;
+  if (memcmp(p, "RIFF", 4) != 0 || memcmp(p + 8, "WEBP", 4) != 0) {
+    return 0;
+  }
+  return (size_t)p[4] | ((size_t)p[5] << 8) | ((size_t)p[6] << 16) |
+         ((size_t)p[7] << 24);
 }
 
 int remote_get(const char* url, uint8_t** buf, size_t* len,
@@ -225,7 +329,10 @@ int remote_get(const char* url, uint8_t** buf, size_t* len,
       .url = url,
       .event_handler = _httpCallback,
       .user_data = &state,
-      .timeout_ms = 20e3,  // Increased from 10s to 20s
+      .timeout_ms =
+          30e3,  // 20s was not enough for the 33 KB animated WebPs the server
+                 // serves once the link is marginal; see the TCP window note in
+                 // sdkconfig.defaults.huidu-wf1
       .crt_bundle_attach = esp_crt_bundle_attach,
   };
 
@@ -254,15 +361,89 @@ int remote_get(const char* url, uint8_t** buf, size_t* len,
   }
 
   // Do the request
+  state.started_us = esp_timer_get_time();
   esp_err_t err = esp_http_client_perform(http);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "couldn't reach %s: %s", url, esp_err_to_name(err));
+    // Link quality is worth measuring rather than inferring: a marginal RSSI
+    // explains a large body timing out while small ones succeed, which is
+    // otherwise indistinguishable from a server or firmware problem.
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+      // `connected` is the figure that matters: it separates "the TCP
+      // connection never came up" (routing, ARP, or the peer refusing us) from
+      // "we connected and then got no reply" (a silent peer, or a path that
+      // only carries in one direction). Those look identical in a timeout.
+      ESP_LOGE(TAG,
+               "  link: rssi %d dBm, channel %u, connected=%s, got %u bytes",
+               ap.rssi, (unsigned)ap.primary, state.connected ? "yes" : "no",
+               (unsigned)state.len);
+    }
     if (state.buf != NULL) {
       free(state.buf);
     }
     if (state.image_url != NULL) {
       free(state.image_url);
       state.image_url = NULL;
+    }
+    esp_http_client_cleanup(http);
+    return 1;
+  }
+
+  // A body shorter than the announced Content-Length is a transfer that was cut
+  // off - the client's own timeout, a dropped connection, or the server closing
+  // early. Handing that to the decoder produces a WebP whose RIFF header is
+  // intact but whose chunks are missing, so WebPGetInfo succeeds and WebPDemux
+  // fails; on the panel that reads as "dmux err" with kilobytes of free heap,
+  // which looks like anything except a network problem. Fail it here instead,
+  // where the cause is legible.
+  if (state.expected > 0 && state.len != state.expected) {
+    ESP_LOGE(TAG,
+             "Truncated response: got %u of %u bytes - discarding",
+             (unsigned)state.len, (unsigned)state.expected);
+    if (state.buf != NULL) {
+      free(state.buf);
+    }
+    if (state.image_url != NULL) {
+      free(state.image_url);
+    }
+    if (state.ota_url != NULL) {
+      free(state.ota_url);
+    }
+    esp_http_client_cleanup(http);
+    return 1;
+  }
+
+  // The buffer was freed mid-transfer (a resize could not be satisfied), so what
+  // we hold is a prefix of the body in no buffer at all. `perform` can still
+  // report success, so this has to be checked explicitly rather than assumed -
+  // and it must be checked before anything tries to read the payload.
+  if (state.buf_lost) {
+    ESP_LOGE(TAG,
+             "Receive buffer lost mid-transfer after %u bytes - discarding",
+             (unsigned)state.len);
+    esp_http_client_cleanup(http);
+    return 1;
+  }
+
+  // Refuse a payload the file itself says is incomplete, so a stalled transfer
+  // becomes an explicit fetch failure the loop can retry, rather than a decoder
+  // error that sends the next person hunting through gfx.c. Seen on the bench:
+  // a 33 KB animated WebP arriving as 2,666 bytes with an intact header.
+  const size_t declared = payload_declared_size(state.buf, state.len);
+  if (declared > 0 && state.len < declared + 8) {
+    ESP_LOGE(TAG,
+             "Short payload: holding %u of %u bytes - the transfer was cut "
+             "off, discarding",
+             (unsigned)state.len, (unsigned)(declared + 8));
+    if (state.buf != NULL) {
+      free(state.buf);
+    }
+    if (state.image_url != NULL) {
+      free(state.image_url);
+    }
+    if (state.ota_url != NULL) {
+      free(state.ota_url);
     }
     esp_http_client_cleanup(http);
     return 1;

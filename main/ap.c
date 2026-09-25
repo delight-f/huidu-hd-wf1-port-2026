@@ -317,20 +317,54 @@ static void stop_dns_server(void) {
   if (s_dns_task_handle != NULL) {
     vTaskDelete(s_dns_task_handle);
     s_dns_task_handle = NULL;
-    ESP_LOGI(TAG, "DNS server stopped");
   }
 }
 
+// Start the captive-portal DNS hijack.
+//
+// Deliberately NOT part of ap_start(). It costs a 4 KB task stack plus a socket
+// out of the same internal heap the WebP decoder needs one large run from -
+// measured at 5,120 bytes, taking the largest free block from 28,672 to 23,552,
+// which is below what a single lossless 64x32 frame needs. And it is only useful
+// while the config portal is actually being used, i.e. while there is no station
+// link or the boot button asked for config mode. In the normal case the SoftAP
+// is retired a second after boot and this task is deleted again - but by then
+// the block it split can never be rejoined, so the cost is permanent while the
+// benefit was a one-second captive-portal popup. main.c starts it only where it
+// is worth that.
+void ap_start_dns(void) { start_dns_server(); }
+
 static esp_err_t diag_handler(httpd_req_t *req) {
-  char hdr[384];
+  // ?heap=1 dumps the heap *layout* (per-region, block counts), not just the
+  // totals. Total free heap is not the number that decides whether a decode
+  // fits - the largest free contiguous block is - and inferring the layout from
+  // totals has already sent this bring-up down three blind alleys. Run it
+  // before the log is copied so the fresh dump lands at the tail of the
+  // response.
+  char query[64];
+  bool want_heap =
+      httpd_req_get_url_query_len(req) > 0 &&
+      httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+      httpd_query_key_value(query, "heap", query, sizeof(query)) == ESP_OK;
+  if (want_heap) {
+    diag_dump_heap_layout();
+    ap_report_task_stacks();
+  }
+
+  multi_heap_info_t int_info;
+  heap_caps_get_info(&int_info, MALLOC_CAP_INTERNAL);
+
+  char hdr[448];
   int hdr_len = snprintf(
       hdr, sizeof(hdr),
       "reset_reason=%d\nfree_heap=%u\nfree_internal=%u\nlargest_internal=%u\n"
-      "free_dma=%u\nlargest_dma=%u\nbrightness=%u\nbtn_gpio%d=%d\n"
-      "btn_gpio0=%d\n--- captured log ---\n",
+      "internal_blocks=%u/%u\nfree_dma=%u\nlargest_dma=%u\nbrightness=%u\n"
+      "btn_gpio%d=%d\n"
+      "btn_gpio0=%d\n--- boot heap trace ---\n",
       (int)esp_reset_reason(), (unsigned)esp_get_free_heap_size(),
       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+      (unsigned)int_info.free_blocks, (unsigned)int_info.total_blocks,
       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
       (unsigned)nvs_get_brightness(), (int)CONFIG_BUTTON_PIN,
@@ -338,6 +372,20 @@ static esp_err_t diag_handler(httpd_req_t *req) {
 
   httpd_resp_set_type(req, "text/plain");
   httpd_resp_send_chunk(req, hdr, hdr_len);
+
+  // The boot heap trace, served from its own fixed array rather than the log
+  // ring: which boot stage destroyed the largest free block is the thing worth
+  // knowing, and the ring loses the boot within seconds.
+  char *trace = malloc(DIAG_HEAP_TRACE_MAX);
+  if (trace != NULL) {
+    size_t n = diag_heap_trace_report(trace, DIAG_HEAP_TRACE_MAX);
+    if (n > 0) {
+      httpd_resp_send_chunk(req, trace, n);
+    }
+    free(trace);
+  }
+
+  httpd_resp_send_chunk(req, "--- captured log ---\n", HTTPD_RESP_USE_STRLEN);
 
   char *log = malloc(4096);
   if (log != NULL) {
@@ -427,13 +475,21 @@ esp_err_t ap_start(void) {
   config.send_wait_timeout = 10;
   config.uri_match_fn = httpd_uri_match_wildcard;
   config.lru_purge_enable = true;
+  // This server exists to answer /diag and the config page on a board whose
+  // whole problem is RAM. The default of 7 sockets means 7 sessions' worth of
+  // scratch buffers allocated for a device that is polled by one person with one
+  // browser; lru_purge_enable means a stale socket is dropped rather than
+  // refused, so a lower ceiling costs nothing here.
+  config.max_open_sockets = 3;
 
   ESP_LOGI(TAG, "Starting web server on 10.10.0.1:%d", config.server_port);
+  diag_log_heap("ap: before httpd");
 
   if (httpd_start(&s_server, &config) != ESP_OK) {
     ESP_LOGE(TAG, "Failed to start web server");
     return ESP_FAIL;
   }
+  diag_log_heap("ap: httpd up");
 
   httpd_uri_t root_uri = {.uri = "/",
                           .method = HTTP_GET,
@@ -489,9 +545,25 @@ esp_err_t ap_start(void) {
                               .user_ctx = NULL};
   httpd_register_uri_handler(s_server, &wildcard_uri);
 
-  start_dns_server();
+  diag_log_heap("ap: uris up");
 
+  // The DNS server is deliberately not started here - see ap_start_dns(). It is
+  // started by main.c only where the config portal is actually in use.
   return ESP_OK;
+}
+
+// Report the stack headroom of the two tasks whose stacks are taken from the
+// same internal heap the WebP decoder needs a large run from. Trimming either
+// stack is the cheapest way to give that run back a few KB, but only if the
+// margin is known - this board has no console, so the number has to come out
+// through /diag.
+void ap_report_task_stacks(void) {
+  TaskHandle_t httpd = xTaskGetHandle("httpd");
+  ESP_LOGI(TAG, "stacks: httpd %u free, dns %u free",
+           httpd != NULL ? (unsigned)uxTaskGetStackHighWaterMark(httpd) : 0,
+           s_dns_task_handle != NULL
+               ? (unsigned)uxTaskGetStackHighWaterMark(s_dns_task_handle)
+               : 0);
 }
 
 esp_err_t ap_stop(void) {
@@ -501,6 +573,39 @@ esp_err_t ap_stop(void) {
   stop_dns_server();
   esp_err_t err = httpd_stop(s_server);
   s_server = NULL;
+  return err;
+}
+
+// Retire the SoftAP but keep the web server. ap_stop() is too blunt here: it
+// also stops httpd, which is the only console this board has (/diag). Nothing
+// about the portal needs to be reachable over the AP once the station link is
+// up, and the AP costs radio buffers, a DHCP server and a 4 KB DNS task stack
+// that the WebP decoder wants more.
+esp_err_t ap_retire_softap(void) {
+  static bool retired = false;
+  if (retired) {
+    return ESP_OK;
+  }
+  retired = true;
+
+  diag_log_heap("softap retire: before");
+
+  stop_dns_server();
+
+  esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+  if (ap_netif != NULL) {
+    esp_netif_dhcps_stop(ap_netif);
+  }
+
+  esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "could not switch to STA-only: %s", esp_err_to_name(err));
+  } else {
+    ESP_LOGI(TAG,
+             "SoftAP retired; web server left running on the station address");
+  }
+
+  diag_log_heap("softap retire: after");
   return err;
 }
 

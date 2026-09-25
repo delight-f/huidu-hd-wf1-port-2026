@@ -516,6 +516,14 @@ void app_main(void) {
 
   // delete here for 5 seconds to allow for serial port to connect.
   ESP_LOGI(TAG, "App Main Start");
+  diag_log_heap("boot");
+
+  // Claim the decode canvas before WiFi, the HTTP server, the WebSocket client
+  // and every task stack have carved up the heap. It is held for the life of
+  // the program either way, so this costs nothing and only changes where it
+  // lands - and the WebP decoder needs one free contiguous 12,544-byte block
+  // that a mid-heap canvas is quite capable of splitting in two.
+  gfx_reserve_decode_buffers();
 
 #if CONFIG_BUTTON_PIN >= 0
   // Configure button pin as input with pull-up
@@ -555,6 +563,7 @@ void app_main(void) {
 
   // Initialize NVS settings
   ESP_ERROR_CHECK(nvs_settings_init());
+  diag_log_heap("after nvs");
 
 #ifdef CONFIG_BOARD_TIDBYT_GEN2
   saved_brightness = nvs_get_brightness();
@@ -572,6 +581,7 @@ void app_main(void) {
     return;
   }
   esp_register_shutdown_handler(&wifi_shutdown);
+  diag_log_heap("after wifi init");
 
   image_url = nvs_get_image_url();
 
@@ -581,6 +591,7 @@ void app_main(void) {
     // config portal (and /diag) still come up.
     ESP_LOGE(TAG, "failed to initialize gfx");
   }
+  diag_log_heap("after display init");
   esp_register_shutdown_handler(&display_shutdown);
 
 #ifdef CONFIG_BOARD_TIDBYT_GEN2
@@ -605,6 +616,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "Starting AP Web Server...");
     ap_start();
   }
+  diag_log_heap("after ap_start");
 
   // Register callback to detect configuration events
   wifi_register_config_callback(config_saved_callback);
@@ -622,6 +634,7 @@ void app_main(void) {
   // This will block until either connected or timeout or short circuit if
   // button was held during button.
   bool sta_connected = wifi_wait_for_connection(60000);
+  diag_log_heap(sta_connected ? "sta connected" : "sta NOT connected");
 
   if (sta_connected) {
     ESP_LOGI(TAG, "WiFi connected successfully!");
@@ -654,6 +667,12 @@ void app_main(void) {
   if (nvs_get_ap_mode()) {
     if (button_boot || !sta_connected) {
       ESP_LOGW(TAG, "WiFi didn't connect or Boot Button Pressed");
+      // The captive-portal DNS hijack is only worth its 5 KB here, where the
+      // portal is going to be used. In the normal case the SoftAP is retired a
+      // second later and the task deleted again, but the large free run it split
+      // on the way up never rejoins - and that run is what the WebP decoder
+      // needs. See ap_start_dns().
+      ap_start_dns();
       // Load up the config webp so that we don't just loop the boot screen over
       // and over again but show the ap config info webp
       ESP_LOGI(TAG, "Loading Config WEBP");
@@ -710,15 +729,6 @@ void app_main(void) {
     }
   }
 
-  // NOTE: upstream auto-shuts the AP down a couple of minutes after this point
-  // (ap_start_shutdown_timer() -> ap_stop() + switch to STA-only). That leaves
-  // the board with no network and no portal if the station link is not up, and
-  // it is the only way to read the on-device log on this board. Keep the portal
-  // available instead.
-  if (nvs_get_ap_mode()) {
-    ESP_LOGI(TAG, "AP portal left running (auto-shutdown disabled)");
-  }
-
   while (true) {
     image_url = nvs_get_image_url();
 
@@ -733,6 +743,25 @@ void app_main(void) {
 
   // image_url is now valid and usable here
   ESP_LOGI(TAG, "Proceeding with image URL: %s", image_url);
+
+  // The setup SoftAP has done its job once there is a station link and an image
+  // URL to fetch: from here on it is radio buffers, a DHCP server and a 4 KB DNS
+  // task stack competing with the WebP decoder for the one contiguous
+  // 12,544-byte block it needs. Retire it - but only when a reboot cannot
+  // strand the device, i.e. the station link is up and we are not sitting in
+  // config mode waiting for credentials. The web server stays up either way, so
+  // /diag and the config pages remain reachable on the station address.
+  //
+  // Upstream instead calls ap_start_shutdown_timer() -> ap_stop(), which takes
+  // the web server down along with the AP, and with it this board's only
+  // console.
+  if (nvs_get_ap_mode()) {
+    if (sta_connected && !button_boot) {
+      ap_retire_softap();
+    } else {
+      ESP_LOGI(TAG, "AP portal left running (no station link or config mode)");
+    }
+  }
 
   char api_key[MAX_API_KEY_LEN + 1];
   if (nvs_get_api_key(api_key, sizeof(api_key)) == ESP_OK &&
@@ -912,7 +941,13 @@ void app_main(void) {
       int64_t fetch_duration_ms =
           (esp_timer_get_time() - fetch_start_us) / 1000;
 
-      ESP_LOGI(TAG, "HTTP fetch returned in %lld ms", fetch_duration_ms);
+      // The stack figure is the main task's minimum-ever headroom. This board
+      // has no console, so a stack overflow here is diagnosed only by a reset
+      // loop and a coredump - and esp_http_client is the heaviest thing this
+      // task does. Reporting it on every fetch means the margin is known rather
+      // than assumed before the task stack is trimmed any further.
+      ESP_LOGI(TAG, "HTTP fetch returned in %lld ms (main stack %u left)",
+               fetch_duration_ms, (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
       if (ota_url != NULL) {
         ESP_LOGI(TAG, "OTA URL received via HTTP: %s", ota_url);
@@ -958,6 +993,7 @@ void app_main(void) {
         display_set_brightness(brightness_pct);
         ESP_LOGI(TAG, "Queuing new webp (%d bytes)", len);
 
+        const int64_t display_start_us = esp_timer_get_time();
         int queued_counter = gfx_update(webp, len, app_dwell_secs);
         // Do not free(webp) here; ownership is transferred to gfx
         webp = NULL;
@@ -984,6 +1020,28 @@ void app_main(void) {
           ESP_LOGE(TAG, "Timeout waiting for gfx task to load image");
         } else {
           ESP_LOGI(TAG, "Gfx task loaded image counter %d ms", queued_counter);
+        }
+
+        // Hold the image for the dwell the server asked for, before fetching the
+        // next one.
+        //
+        // gfx consumes the dwell itself for animations - its frame loop runs
+        // until dwell_us elapses - but a still image is a single frame, so that
+        // loop returns immediately and nothing else in this task ever waited.
+        // The board therefore fetched the next image as fast as the network
+        // allowed instead of once per dwell: measured on the bench at ~1.2 images
+        // a second, sustained, indefinitely. That is a client polling a server far
+        // harder than the app cadence implies, and the visible symptom when the
+        // server pushes back is a panel stuck on a stale image while every fetch
+        // times out with zero bytes.
+        //
+        // Sleep only the remainder, so an animation is not then held for twice
+        // the requested dwell, and an animation shorter than its dwell still gets
+        // the full time on screen.
+        const int64_t dwell_us = (int64_t)app_dwell_secs * 1000000;
+        const int64_t shown_us = esp_timer_get_time() - display_start_us;
+        if (shown_us < dwell_us) {
+          vTaskDelay(pdMS_TO_TICKS((uint32_t)((dwell_us - shown_us) / 1000)));
         }
 
         // ESP_LOGD(TAG, "Setting isAnimating to 1");

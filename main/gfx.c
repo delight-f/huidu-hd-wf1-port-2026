@@ -14,6 +14,7 @@
 #include <webp/demux.h>
 
 #include "assets.h"
+#include "diag.h"
 #include "display.h"
 #include "esp_timer.h"
 #include "nvs_settings.h"
@@ -127,10 +128,16 @@ int gfx_initialize(const char *img_url) {
   }
   ESP_LOGI(TAG, "done with gfx init");
 
+  // The panel's framebuffer is the biggest buffer this firmware owns, and it is
+  // allocated here - after WiFi, lwIP and the HTTP server have already carved
+  // up the heap. Trace either side of it: this is the stage most likely to be
+  // splitting the largest free block that libwebp needs.
+  diag_log_heap("before panel fb");
   // Initialize the display
   if (display_initialize()) {
     return 1;
   }
+  diag_log_heap("after panel fb");
 
   if (nvs_get_skip_boot_animation()) {
     display_clear();
@@ -293,7 +300,12 @@ static void send_websocket_notification(int counter) {
   }
 }
 
-int gfx_update(void *webp, size_t len, int32_t dwell_secs) {
+// Queue an image for the gfx task. `is_static` says the buffer points into flash
+// rodata, which is memory-mapped and must not be freed - the same arrangement the
+// boot animation uses, and the reason the built-in screens can be decoded without
+// ever being resident in RAM.
+static int gfx_queue(void *webp, size_t len, int32_t dwell_secs,
+                     bool is_static) {
   if (pdTRUE != xSemaphoreTake(_state->mutex, portMAX_DELAY)) {
     ESP_LOGE(TAG, "Could not take gfx mutex");
     return -1;  // Return negative on error
@@ -315,7 +327,7 @@ int gfx_update(void *webp, size_t len, int32_t dwell_secs) {
 
   // Take ownership of new buffer (no copy)
   _state->buf = webp;
-  _state->buf_is_static = false;
+  _state->buf_is_static = is_static;
   _state->len = len;
   _state->dwell_secs = dwell_secs;
   _state->counter++;
@@ -363,6 +375,10 @@ int gfx_get_loaded_counter(void) {
   return loaded;
 }
 
+int gfx_update(void *webp, size_t len, int32_t dwell_secs) {
+  return gfx_queue(webp, len, dwell_secs, false);
+}
+
 int gfx_display_asset(const char *asset_type) {
   const uint8_t *asset_data = NULL;
   size_t asset_len = 0;
@@ -386,30 +402,25 @@ int gfx_display_asset(const char *asset_type) {
     return 1;
   }
 
-  // Allocate heap memory and copy asset data
-  uint8_t *asset_heap_copy = (uint8_t *)malloc(asset_len);
-  if (asset_heap_copy == NULL) {
-    ESP_LOGE(TAG, "Failed to allocate memory for %s asset copy", asset_type);
-    return 1;
-  }
-
-  memcpy(asset_heap_copy, asset_data, asset_len);
-
-  // Interrupt current animation to display asset immediately
+  // Decode the asset from flash rodata, in place, with no heap copy.
+  //
+  // The previous code malloc'd `asset_len` and memcpy'd before queueing, which
+  // meant every built-in screen needed internal RAM at least as large as the
+  // asset. That is survivable for the small ones and impossible for the two that
+  // matter most on a board this tight: the oversize screen is 36,724 bytes and the
+  // 404 screen is 27,180. So the fallback whose entire job is to say "that image
+  // is too big for me" was itself too big to allocate - it failed with
+  // "Failed to allocate memory for oversize asset copy", the screen was never
+  // drawn, and the panel sat on a stale decode error with a red dot while the log
+  // said the ceiling had worked correctly.
+  //
+  // rodata is memory-mapped and WebPDecode only reads, so the copy buys nothing.
+  // This is the same arrangement the boot animation already uses.
   isAnimating = -1;
-
-  // Display the asset with no dwell time (static display)
-  int result = gfx_update(asset_heap_copy, asset_len, 0);
-  if (result < 0) {
-    // Only free if gfx_update failed to take ownership (returned negative
-    // error)
-    ESP_LOGE(TAG, "Failed to update graphics with %s asset", asset_type);
-    free(asset_heap_copy);
+  if (gfx_queue((void *)asset_data, asset_len, 0, true) < 0) {
+    ESP_LOGE(TAG, "Failed to queue %s asset", asset_type);
     return 1;
   }
-
-  // gfx_update now owns the asset_heap_copy buffer (returns counter >= 0 on
-  // success)
   return 0;
 }
 
@@ -546,6 +557,87 @@ static bool grow_buffer(uint8_t **buf, size_t *capacity, size_t need) {
   return true;
 }
 
+// Take the canvas now, while the heap is still one piece.
+//
+// The canvas is allocated once and held for the life of the program, so *where*
+// it lands matters far more than how big it is. Allocating it lazily - inside
+// the first draw_webp(), after WiFi, the HTTP server, the WebSocket client and
+// every task stack have already carved up the heap - lands it in the middle of
+// whatever large run is left. libwebp then wants one free contiguous block for a
+// 64x32 lossless frame and cannot get it. Reserving the canvas first makes the
+// network stack work around it instead.
+//
+// The size comes from the panel rather than from the first image, so this can
+// run before anything else, including display_initialize().
+void gfx_reserve_decode_buffers(void) {
+  const int w = display_panel_width();
+  const int h = display_panel_height();
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+
+  const size_t need = (size_t)w * (size_t)h * 3;
+  diag_log_heap("canvas reserve: before");
+  if (!grow_buffer(&s_canvas, &s_canvas_size, need)) {
+    ESP_LOGW(TAG, "could not pre-allocate %u-byte canvas", (unsigned)need);
+    return;
+  }
+  ESP_LOGI(TAG, "pre-allocated %u-byte canvas (%dx%d)", (unsigned)need, w, h);
+  diag_log_heap("canvas reserve: after");
+}
+
+// Release the composite scratch.
+//
+// This buffer is a cache, not a fixture. It is only useful to frame sequences
+// that can afford it, but once allocated it was held for the life of the
+// program - so a single animation early in a session permanently cost 8 KB
+// (w*h*4), to be paid by every still frame and every large frame afterwards.
+// That is the difference between a 31 KB payload decoding and not: with the
+// scratch held, the largest free run sits under the ~12.5 KB libwebp needs,
+// and the on-panel diagnostic reads exactly that ("dec ERR, h20k b11k").
+//
+// Releasing it before a decode that will not composite hands the space to the
+// decoder; a later animation that can afford it simply allocates it again.
+static void release_frame_scratch(void) {
+  if (s_frame == NULL) {
+    return;
+  }
+  ESP_LOGI(TAG, "released %u-byte composite scratch (free %u largest %u)",
+           (unsigned)s_frame_size,
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+  free(s_frame);
+  s_frame = NULL;
+  s_frame_size = 0;
+}
+
+// Names libwebp's failure so the log says which kind of problem it was.
+// "out of memory" means the heap could not hand over one contiguous block;
+// "bitstream error" / "not enough data" mean the bytes were wrong - and those
+// two have nothing to do with each other as fixes.
+static const char *vp8_status_name(VP8StatusCode s) {
+  switch (s) {
+    case VP8_STATUS_OK:
+      return "ok";
+    case VP8_STATUS_OUT_OF_MEMORY:
+      return "out of memory";
+    case VP8_STATUS_INVALID_PARAM:
+      return "invalid param";
+    case VP8_STATUS_BITSTREAM_ERROR:
+      return "bitstream error";
+    case VP8_STATUS_UNSUPPORTED_FEATURE:
+      return "unsupported feature";
+    case VP8_STATUS_SUSPENDED:
+      return "suspended";
+    case VP8_STATUS_USER_ABORT:
+      return "user abort";
+    case VP8_STATUS_NOT_ENOUGH_DATA:
+      return "not enough data";
+    default:
+      return "unknown";
+  }
+}
+
 // Mirror of libwebp's IsKeyFrame (anim_decode.c). A key frame means the canvas
 // is cleared before the frame is decoded rather than carried over.
 static bool is_key_frame(const WebPIterator *cur, const WebPIterator *prev,
@@ -633,7 +725,22 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
 
   WebPDemuxer *demux = WebPDemux(&webpData);
   if (demux == NULL) {
-    ESP_LOGE(TAG, "WebPDemux failed");
+    // WebPGetInfo has already succeeded by now, which means the first bytes
+    // looked like a WebP and the declared dimensions were readable - so a demux
+    // failure means the container is either short or misframed. Print the magic
+    // and the RIFF-declared size against the length we actually hold: those two
+    // numbers separate "truncated transfer" from "corrupt or wrongly framed
+    // payload", which point at completely different fixes.
+    if (len >= 12) {
+      const uint8_t *p = (const uint8_t *)buf;
+      const unsigned riff_size = (unsigned)p[4] | ((unsigned)p[5] << 8) |
+                                 ((unsigned)p[6] << 16) | ((unsigned)p[7] << 24);
+      ESP_LOGE(TAG, "WebPDemux failed: len=%u riff=%u magic=%.4s%.4s", 
+               (unsigned)len, riff_size, (const char *)p, (const char *)p + 8);
+    } else {
+      ESP_LOGE(TAG, "WebPDemux failed: len=%u too short for a container",
+               (unsigned)len);
+    }
     diag_panel("dmux", len, false);
     return 1;
   }
@@ -655,6 +762,13 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
     }
   }
 
+  // Anything that will not composite gives the scratch back before decoding, so
+  // the decoder gets it rather than it idling as a cache. This includes the
+  // still-image path, which never wants the scratch at all.
+  if (!composite) {
+    release_frame_scratch();
+  }
+
   const int64_t start_us = esp_timer_get_time();
   bool decoded_any = false;
   bool failed_any = false;
@@ -672,6 +786,7 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
 
       WebPDecoderConfig cfg;
       bool ok = false;
+      VP8StatusCode status = VP8_STATUS_OK;
       if (WebPInitDecoderConfig(&cfg)) {
         cfg.output.is_external_memory = 1;
         cfg.options.no_fancy_upsampling = 1;
@@ -694,8 +809,8 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
           cfg.output.u.RGBA.stride = w * 3;
           cfg.output.u.RGBA.size = (size_t)iter.height * (size_t)w * 3;
         }
-        ok = WebPDecode(iter.fragment.bytes, iter.fragment.size, &cfg) ==
-             VP8_STATUS_OK;
+        status = WebPDecode(iter.fragment.bytes, iter.fragment.size, &cfg);
+        ok = status == VP8_STATUS_OK;
       }
 
       if (ok) {
@@ -708,8 +823,26 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
         display_draw(canvas, w, h, 3, 0, 1, 2);
         decoded_any = true;
       } else {
-        ESP_LOGE(TAG, "frame %d decode failed", iter.frame_num);
+        // The status separates "the heap could not give us a contiguous block"
+        // from "the bytes were not a valid frame" - two failures that are
+        // indistinguishable from a bare "decode failed", and which point at
+        // completely different fixes. The heap figures are read here rather than
+        // at the top because this is the only moment that matters.
+        ESP_LOGE(TAG, "frame %d decode failed (%s), free %u largest %u", 
+                 iter.frame_num, vp8_status_name(status),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         failed_any = true;
+        // Nothing has decoded, so this frame will not decode on the next pass
+        // either - and an animation can carry hundreds of frames. Without this
+        // the loop grinds through every one of them on every pass of the dwell,
+        // holding the payload for the whole ride, which is how a single
+        // too-large asset turns a board into one that looks hung instead of one
+        // that reports an error and moves on. Observed on the bench at frame 141
+        // and still counting.
+        if (!decoded_any) {
+          break;
+        }
       }
 
       prev = iter;

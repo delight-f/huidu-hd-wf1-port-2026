@@ -14,6 +14,12 @@ int display_initialize(void);
 void display_set_brightness(uint8_t brightness_pct);
 void display_shutdown(void);
 
+// Compile-time panel geometry for the active board. Lets other modules size
+// their buffers to the panel (see gfx_reserve_decode_buffers) without waiting
+// for display_initialize() to have run.
+int display_panel_width(void);
+int display_panel_height(void);
+
 void display_draw(const uint8_t* pix, int width, int height, int channels,
                   int ixR, int ixG, int ixB);
 

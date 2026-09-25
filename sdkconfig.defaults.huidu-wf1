@@ -11,7 +11,24 @@ CONFIG_BUTTON_PIN=11
 # ~4.5 KB (same choice the no-PSRAM pixoticker target uses).
 CONFIG_BOOT_WEBP_PARROT=y
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-CONFIG_HTTP_BUFFER_SIZE_MAX=60000
+# Receive-buffer ceiling, and with it the largest image this board will attempt.
+#
+# The 60,000 inherited from the base config is far past what a no-PSRAM S2 can
+# display. The payload has to stay resident *while* libwebp decodes it, so the
+# requirement is payload + decoder working set, not the larger of the two.
+# Measured with the host harness on the assets the server actually serves:
+#
+#   360 B     payload + ~11.9 KB decoder  = ~12 KB   works in ~41 KB free
+#   11,305 B  payload + ~18 KB decoder    = ~30 KB   works
+#   22,000 B  payload + ~20-26 KB decoder = ~42-48 KB  exceeds free
+#   33,084 B  payload + 25.9 KB decoder   = ~59 KB   far exceeds free
+#
+# So ~15 KB is the practical ceiling and the large animated apps cannot ever work
+# here. Rejecting them at the Content-Length check uses the existing oversize
+# screen, which is a board that reports "too big" and carries on rather than one
+# that half-fetches a 22 KB animation, holds the payload, and grinds through its
+# frames failing - which is what an unbounded limit produced on the bench.
+CONFIG_HTTP_BUFFER_SIZE_MAX=16384
 CONFIG_HTTP_BUFFER_SIZE_DEFAULT=4000
 CONFIG_IDF_TARGET="esp32s2"
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="boards/max_app_4mb.csv"
@@ -19,3 +36,42 @@ CONFIG_SPIRAM=n
 # Capture panics to the coredump partition so a reset loop can be diagnosed
 # without a console (the board has no UART bridge and S2 USB-CDC is unusable).
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+# WiFi RX buffers: pre-allocated rather than on-demand, which is the distinction
+# that matters here and that cost several flash cycles to find.
+#
+# The stock counts (static 10 / dynamic 32) fetch reliably - 141-326 ms including
+# 11 KB bodies - but cost 20.6 KB, and at that size boot cannot afford the boot
+# animation's own decode: the board panics (ESP_RST_PANIC) with free 25 KB after
+# ap_start. Trimming the counts (static 6 / dynamic 8) boots fine and frees the
+# memory, but cannot receive a ~22 KB body at all: every attempt dies after 1-4 KB
+# and takes 30-50 s.
+#
+# The two failures together name the mechanism. DYNAMIC_RX_BUFFER_NUM is a pool the
+# driver draws from *on demand* - and a large image response makes us allocate a
+# large receive buffer first, fragmenting exactly that heap. So the receive path
+# loses its buffers in the middle of the transfer it needs them for.
+#
+# Fix: pay for the buffers *early* instead of late. Same order of memory as the
+# trimmed build (which booted), but the capacity exists before anything can
+# fragment the heap, so a large transfer never needs an allocation to make
+# progress. Static buffers are allocated once at WiFi init, while the heap is
+# still one piece.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=12
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16
+# A-MPDU stays off: it buys nothing for one HTTP fetch and costs block-ack window
+# buffers, and it was off in the build that booted cleanly.
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=2048
+# Trimmed only after adding a watermark report to every fetch (see the print in
+# main.c) so the margin is known rather than assumed - esp_http_client is the
+# deepest thing this task does. Measured headroom: ~3.3 KB.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+# Tried and REVERTED: raising TCP_WND to 11680 here, alongside restoring full TX
+# power, made the transport worse rather than better - 1,226-byte payloads went
+# from 36 ms to 39-42 s. Whatever governs this device's receive throughput, it is
+# not simply window size, and a window the receive path cannot actually back with
+# buffers is a plausible way to make it worse. The base defaults are left alone
+# from here; change one of these only with fetch latency measured either side.
