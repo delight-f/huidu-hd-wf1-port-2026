@@ -566,11 +566,17 @@ static void gfx_loop(void *args) {
 //                         buffer is enough and no second canvas is ever held.
 //                         The result is byte-identical to WebPAnimDecoder's.
 //
-// The scratch is only taken when the decoder can still afford its own ~26 KB
-// working set afterwards (GFX_DECODE_HEADROOM); otherwise frames are drawn
-// directly, which positions them correctly but does not blend partial frames
-// over their predecessors.
-#define GFX_DECODE_HEADROOM (30 * 1024)
+// The scratch is only taken when the decoder can still afford its own working set
+// afterwards (GFX_DECODE_MIN_RUN); otherwise frames are drawn directly, which
+// positions them correctly but does not blend partial frames over their
+// predecessors.
+//
+// libwebp needs that set as a single contiguous run: measured at 21,320 bytes for
+// a 64x32 lossless frame, as an 11,816-byte block plus a ~9,504-byte one. So the
+// gate tests the largest free run against this figure, with a little margin,
+// rather than testing total free memory - totals only correlate with it, and
+// three fixes in this port were aimed from totals and all three missed.
+#define GFX_DECODE_MIN_RUN (22 * 1024)
 
 static uint8_t *s_canvas = NULL;
 static size_t s_canvas_size = 0;
@@ -867,27 +873,38 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
   // Compositing needs an RGBA scratch, so only multi-frame images can want it,
   // and only when taking it still leaves the decoder room to work. A still
   // image therefore costs nothing but the canvas.
+  //
+  // The test is on the LARGEST FREE RUN, not on total free memory. Total free is a
+  // proxy for the wrong quantity, and this port has now missed three fixes by
+  // aiming from totals: what decides whether libwebp can decode is one contiguous
+  // ~21,320-byte region. So: take the scratch first, then ask the heap whether the
+  // decoder can still get its run, and hand the scratch straight back if it
+  // cannot. Refusing to composite is not a neutral failure - an unblended partial
+  // frame is exactly what a missing-pixels animation looks like - but engaging
+  // when the decode then fails is worse, because nothing appears at all.
   bool composite = false;
   if (WebPDemuxGetI(demux, WEBP_FF_FRAME_COUNT) > 1) {
     const size_t free_now = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-    // GFX_DECODE_HEADROOM exists to stop the scratch from consuming the run
-    // libwebp is about to need. With the arena reserved that run is already held
-    // back, and at decode time the decoder takes it from the arena whatever the
-    // scratch has done - so demanding the margin here does not protect anything,
-    // it only guarantees that composites never happen. That is not a neutral
-    // failure: an unblended partial frame is what a missing-pixels animation
-    // looks like, and because the gate used to sit right on the boundary of a
-    // fluctuating heap, the same image would composite on one redraw and not the
-    // next, which is what made it flicker.
-    const size_t reserve = s_arena_wanted ? 0 : GFX_DECODE_HEADROOM;
-    if (free_now >= frame_need + reserve &&
-        grow_buffer(&s_frame, &s_frame_size, frame_need)) {
-      composite = true;
+    // A reserved arena already holds the decoder's runway back, so it is the
+    // decoder's own need that matters there rather than decoder-plus-margin.
+    const size_t need = s_arena_wanted ? GFX_DECODE_MIN_RUN
+                                       : GFX_DECODE_MIN_RUN + frame_need;
+    if (grow_buffer(&s_frame, &s_frame_size, frame_need)) {
+      const size_t largest =
+          heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+      if (largest >= need) {
+        composite = true;
+      } else {
+        ESP_LOGW(TAG,
+                 "largest free run %u < %u needed (free %u) - drawing frames "
+                 "directly without compositing",
+                 (unsigned)largest, (unsigned)need, (unsigned)free_now);
+      }
     } else {
       ESP_LOGW(TAG,
-               "only %u bytes free - drawing frames directly without "
-               "compositing",
-               (unsigned)free_now);
+               "no room for the %u-byte composite scratch (free %u) - drawing "
+               "frames directly without compositing",
+               (unsigned)frame_need, (unsigned)free_now);
     }
   }
 

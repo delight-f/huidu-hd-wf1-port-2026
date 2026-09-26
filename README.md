@@ -194,10 +194,10 @@ The number that matters is not total free memory but what must be **live at the 
 
 The board has roughly **43 KB** free once WiFi and the display are up, and less at runtime. It cannot hold all of that, and the shortfall surfaces as **two different failures that both just look like wrong pixels**:
 
-1. **Compositing is refused** — `only NNNNN bytes free - drawing frames directly without compositing`. The fallback decodes each frame to RGB and **drops alpha**, so an animation whose frames are partial or transparent paints wrong.
+1. **Compositing is refused** — the gate reports the largest free run it measured (`largest free run NNNNN < 22528 needed`). The fallback decodes each frame to RGB and **drops alpha**, so an animation whose frames are partial or transparent paints wrong — this is what "incomplete and black pixels" looks like from outside.
 2. **Later frames fail** — `frame 2 decode failed (out of memory)`. Frame 1 (full canvas) decodes, the heap is then too chopped for frame 2, and the animation renders **partially**.
 
-Reserving memory to guarantee the decoder its runway was tried (see the arena row below) and made things worse, because the fetch needs 6–8 KB in one piece at the same time. The levers that genuinely raise this budget are the ones above: colour depth, canvas format, task stacks, WiFi buffers — and the receive ceiling, which bounds the largest payload.
+Reserving memory to guarantee the decoder its runway was tried (see the arena row below) and made things worse, because the fetch needs 6–8 KB in one piece at the same time. The levers that genuinely raise this budget are canvas format, task stacks and WiFi buffers — plus the receive ceiling, which bounds the largest payload. **Colour depth is not one of them**, however much it looks like it: it appears to cost ~2 KB per bit and really costs ~15 KB, and lowering it silently corrupts colour (see the table below).
 
 **The fix that mattered was not a lever at all.** After the trims the board still had 33–42 KB *free* at decode time but only 14–18 KB of it **contiguous**, because the gfx task deliberately keeps the compressed image so the animation can keep looping between fetches — while the main task is simultaneously receiving the next payload. Two large blocks, neither big enough. The fix was to stop the two coexisting: `gfx_shed_retained()` hands the displayed image back before each fetch.
 
@@ -213,7 +213,7 @@ Recorded so the next person does not repeat them:
 | Attempt | Result |
 | --- | --- |
 | Move WiFi code out of IRAM (`IRAM_OPT=n`) | Frees DIRAM at link time, makes the **runtime** heap worse (24,948 → 20,368 free) |
-| Lower the panel's BCM colour depth | **Tried, and reverted — it silently corrupts colour.** The depth was trimmed 8 → 6 → 5 to buy memory, and every step was colour-broken: the driver picks its CIE correction table at *compile* time but then reduces a colour by reading the **low** `depth` bits of that table's 8-bit output. That is a sawtooth per channel rather than a scale, so channels reorder — brown rendered pink, blue rendered green. Depth 8 is the only value that is correct without rebuilding the library, and it is upstream's default. `tools/webp-host-harness/depth_sim` reproduces the table |
+| Lower the panel's BCM colour depth | **Tried, and it silently corrupts colour — a trap worth reading twice.** The depth was trimmed 8 → 6 → 5 for memory and every step was colour-broken, because the driver picks its CIE correction table from `PIXEL_COLOR_DEPTH_BITS` at *compile* time and then reduces each colour by reading the **low** `depth` bits of it. Mismatch the two and every channel becomes a sawtooth rather than a scale, so channels reorder — brown rendered pink, blue rendered green. The straight fix is depth 8, upstream's default and needing no rebuild, **but it costs ~15.3 KB here**, not the ~2 KB per bit the framebuffer maths suggests: the panel-framebuffer stage measures 16,160 bytes at 5 bits and 31,544 at 8, because the library sizes its DMA descriptors from the depth as well. At 8 that ate the compositing headroom and frames stopped decoding. The port runs **6, with `PIXEL_COLOR_DEPTH_BITS=6` injected into the library from the top-level `CMakeLists.txt`** — a native table depth, so still monotonic, still correct, and ~9 KB cheaper. `tools/webp-host-harness/depth_sim` reproduces the mapping |
 | Raise `TCP_WND` to 11,680 | Much worse: 1,226-byte payloads went from 36 ms to 39–42 s |
 | Over-trim `STATIC_RX` / `DYNAMIC_RX` | Breaks the transport entirely (see §7) |
 | Decoder cropping / scaling options | Cropping is output-only (peak unchanged); scaling is **worse** (18,200 → 19,456 B) |
@@ -317,7 +317,7 @@ http://<device-ip>/panel?clear=1         # back to compiled-in defaults
 
 `drv`: `0`=SHIFTREG, `1`=FM6124, `2`=FM6126A, `3`=ICN2038S, `4`=MBI5124, `5`=DP3246.
 
-The compiled defaults for the WF1 are **FM6124**, `TYPE138` line addressing, 20 MHz, latch blanking 1, double buffering **off**, 8-bit BCM. These overrides live in NVS and **survive reflashing** — clear them before comparing against the compiled defaults.
+The compiled defaults for the WF1 are **FM6124**, `TYPE138` line addressing, 20 MHz, latch blanking 1, double buffering **off**, 6-bit BCM. These overrides live in NVS and **survive reflashing** — clear them before comparing against the compiled defaults.
 
 ---
 
@@ -359,7 +359,7 @@ sdkconfig.defaults.huidu-wf1  the WF1's tunables, each with its measurement
 
 **Verified on hardware since the trims:** the retained-image release — 28 shed releases in a 3.5-minute window, `frame 2 decode failed` eliminated, 24/24 samples stable — and the RGB565 byte-order fix.
 
-**Built and host-verified, not yet run on hardware:** the return to **8-bit panel depth**, which is the second and larger colour bug (see the row in [Tried, measured, and rejected](#tried-measured-and-rejected)). It is expected to cost ~6 KB of DMA framebuffer, taking boot `largest` from 47,104 to roughly 40,960 — still well clear of the ~21,320 a decode needs, which is the whole reason the trims and the release were worth doing.
+**Built and host-verified, not yet run on hardware:** the move to **6-bit depth with a matched CIE table**, and the composite gate now testing the largest free run instead of total free. Depth 8 was tried first and *did* fix the colour, but it cost ~15.3 KB — enough to push free heap permanently under the composite threshold and make frames stop decoding — so 6 buys the same correctness for ~9 KB less. Success looks like no `frame 1 decode failed`, `largest free run` clearing 22 KB at decode time, and true colours on the panel.
 
 **Open, in priority order:**
 
