@@ -213,7 +213,7 @@ Recorded so the next person does not repeat them:
 | Attempt | Result |
 | --- | --- |
 | Move WiFi code out of IRAM (`IRAM_OPT=n`) | Frees DIRAM at link time, makes the **runtime** heap worse (24,948 → 20,368 free) |
-| Lower the panel's BCM colour depth | **Adopted**, now the WF1 default at 5 bits. Bigger than it looks — the framebuffer is ~2 KB per bit — but it shifts `nsPerRow` and so **changes panel timing**, which has to be judged on the panel (and only after a power-cycle, since a flash leaves collapsed rows) |
+| Lower the panel's BCM colour depth | **Tried, and reverted — it silently corrupts colour.** The depth was trimmed 8 → 6 → 5 to buy memory, and every step was colour-broken: the driver picks its CIE correction table at *compile* time but then reduces a colour by reading the **low** `depth` bits of that table's 8-bit output. That is a sawtooth per channel rather than a scale, so channels reorder — brown rendered pink, blue rendered green. Depth 8 is the only value that is correct without rebuilding the library, and it is upstream's default. `tools/webp-host-harness/depth_sim` reproduces the table |
 | Raise `TCP_WND` to 11,680 | Much worse: 1,226-byte payloads went from 36 ms to 39–42 s |
 | Over-trim `STATIC_RX` / `DYNAMIC_RX` | Breaks the transport entirely (see §7) |
 | Decoder cropping / scaling options | Cropping is output-only (peak unchanged); scaling is **worse** (18,200 → 19,456 B) |
@@ -317,7 +317,7 @@ http://<device-ip>/panel?clear=1         # back to compiled-in defaults
 
 `drv`: `0`=SHIFTREG, `1`=FM6124, `2`=FM6126A, `3`=ICN2038S, `4`=MBI5124, `5`=DP3246.
 
-The compiled defaults for the WF1 are **FM6124**, `TYPE138` line addressing, 20 MHz, latch blanking 1, double buffering **off**, 5-bit BCM. These overrides live in NVS and **survive reflashing** — clear them before comparing against the compiled defaults.
+The compiled defaults for the WF1 are **FM6124**, `TYPE138` line addressing, 20 MHz, latch blanking 1, double buffering **off**, 8-bit BCM. These overrides live in NVS and **survive reflashing** — clear them before comparing against the compiled defaults.
 
 ---
 
@@ -357,7 +357,9 @@ sdkconfig.defaults.huidu-wf1  the WF1's tunables, each with its measurement
 
 **Verified on hardware:** builds and flashes under ESP-IDF v5.5 for `esp32s2`; boots and pins tasks on the single core; joins WiFi and gets DHCP over IPv4; fetches real images from the Tronbyt server in tens to a few hundred milliseconds (29–326 ms measured); displays stills and animations; serves the config portal, `/diag` and `/panel`; and the decode/compositing logic is byte-identical to libwebp's own animation decoder on the host harness. The memory trims are measured on the board — boot heap after `ap_start` is **56,216 free / 47,104 largest**, up from 41,084 / 32,768 — and hold steady over minutes of operation.
 
-**Built and host-verified, not yet run on hardware:** the retained-image release and the RGB565 byte-order fix. Success looks like a ~13 KB animated app decoding **all** of its frames (no `frame 2 decode failed`), `largest_internal` clearing ~21,320 at decode time, and true colours on the panel.
+**Verified on hardware since the trims:** the retained-image release — 28 shed releases in a 3.5-minute window, `frame 2 decode failed` eliminated, 24/24 samples stable — and the RGB565 byte-order fix.
+
+**Built and host-verified, not yet run on hardware:** the return to **8-bit panel depth**, which is the second and larger colour bug (see the row in [Tried, measured, and rejected](#tried-measured-and-rejected)). It is expected to cost ~6 KB of DMA framebuffer, taking boot `largest` from 47,104 to roughly 40,960 — still well clear of the ~21,320 a decode needs, which is the whole reason the trims and the release were worth doing.
 
 **Open, in priority order:**
 

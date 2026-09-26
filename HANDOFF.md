@@ -15,10 +15,10 @@ The port works: it boots, joins WiFi, fetches from the Tronbyt server and puts p
 | Fetching | Works, IPv4 only, 29–326 ms typical. A 30 s timeout has been seen when the server was busy rendering |
 | Stills | Decode and display |
 | Animations | Decode and composite. The displayed image is now released before each fetch, so the decode gets one large contiguous block instead of competing with it (§3) |
-| Colour | Panel driven at 5 bits/channel, canvas is RGB565. **The 565 byte order is a trap** — see §7 |
+| Colour | Canvas is RGB565 and the panel runs at **8 bits/channel**. Two separate colour traps — see traps 10 and 11 |
 | Bench scaffolding | Removed (cycler, boot fills, on-panel readout). `/diag` and `/panel` remain |
 | Decode arena | Implemented, **deliberately disabled** — see §5 |
-| Depth / stacks / WiFi RX | Trimmed to 5-bit BCM, main 5120, gfx 4608, static RX 10 |
+| Depth / stacks / WiFi RX | Depth **8** — do not lower it, see trap 11. Main 5120, gfx 4608, static RX 10 |
 | Upstream | Rebased onto `tronbyt/firmware-esp32` `5013f42` (PR #161) — see §9 |
 
 **Nothing here is finished.** Treat every number as a measurement with a date on it, not a guarantee.
@@ -106,6 +106,7 @@ cp build/firmware.elf artifacts/$(date +%Y%m%d)-<what>.elf
 - **Verified on device after flashing this and the 565 fix.** The shed fires on every fetch — 28 releases in a 3.5-minute window — and **`frame 2 decode failed` is gone**, though it had been the dominant failure. All 24 samples in that window showed `reset_reason=1`. `largest_internal` now mostly sits at 38,912–47,104 instead of 14,336–18,432.
 - **Two residuals, both about contiguous size rather than free size.** (1) The compositing gate still refuses from time to time — `only 38472 bytes free` against its 38,912 threshold, a 440-byte miss — because it tests *total free* when the real requirement is *one big run*. (2) One decode still failed frame 1: `frame 1 decode failed (out of memory), free 41308 largest 19456`. Plenty free, not enough contiguous, against libwebp's ~21,320.
 - **The gate is the cheap fix and the honest one.** Allocate the scratch first, then require `heap_caps_get_largest_free_block()` to clear ~22 KB — just over the measured 21,320 — and give the scratch back if it does not. That gates on the number that actually predicts a decode instead of a proxy for it, and it is the same lesson this port keeps relearning. The frame-1 residual is a separate, harder problem: genuine fragmentation, not the gate.
+- **A second and larger colour bug, independent of the 565 layout: the panel depth itself.** It was trimmed 8 → 6 → 5 for memory, and the driver's colour path does not survive that — see trap 11. `depth_sim` shows depth 5 mapping input 200 → 82 and 139 → 205, i.e. non-monotonic, which is exactly the hue inversion reported from the panel. Restored to 8, costing ~6,144 B of framebuffer (boot `largest` 47,104 → ~40,960, still far above the ~21,320 a decode needs). Depth 8 is also upstream's default, so unlike the unguarded 5 it replaced, it cannot harm another board.
 
 ---
 
@@ -143,12 +144,13 @@ It is kept in `gfx.c` behind `GFX_DECODE_ARENA_ENABLED 0` with the full reasonin
 
 1. **The trims landed — confirmed on device.** Boot heap after `ap_start` is 56,216 / 47,104, and the board is stable across minutes. See §3.
 2. **Done — the retained-image shed and the 565 fix are on the board and verified** (§3). Frame-2 failures are gone and 24/24 samples were stable.
-3. **Gate compositing on the largest free block rather than on total free.** Allocate the scratch, then require `heap_caps_get_largest_free_block()` to clear ~22 KB, and hand the scratch back if it does not (§3, last bullet). Cheapest remaining win, and it removes the `only … bytes free` refusals that still leave some animation frames unblended.
-4. **Then attack the frame-1 residual.** One decode still fails with 41 KB free but only 19,456 contiguous against ~21,320 needed. That is genuine fragmentation, so find out what else is in the heap at that moment — either instrument the failure with the block layout, or give the payload a fixed boot-reserved buffer so each fetch stops carving a new hole.
-5. **Re-open the arena only if 3 and 4 fail**, sized by those numbers. It was parked for starving the *receive* path, so any give/take design has to leave a fetch its 6–8 KB.
-6. **Treat the payload ceiling as a last resort.** Dropping it to ~8 KB shrinks the payload term but refuses more apps, and the server is where oversized assets genuinely belong.
-7. **Measure the gfx task's stack watermark on a *successful* decode.** It was trimmed to 4,608 on a reading taken while decodes were failing, which understates the real peak. If it is tight, that shows up as a reset, and you are back in §7.
-8. **Keep the ELF before every flash.**
+3. **Flash the depth-8 build and look at the panel.** Built but not on the board, and it is the fix for the brown/pink and blue/green inversion (trap 11). Expect boot `largest` around 40,960.
+4. **Gate compositing on the largest free block rather than on total free.** Allocate the scratch, then require `heap_caps_get_largest_free_block()` to clear ~22 KB, and hand the scratch back if it does not (§3). Cheapest remaining win, and it removes the `only … bytes free` refusals that still leave some animation frames unblended.
+5. **Then attack the frame-1 residual.** One decode still failed with 41 KB free but only 19,456 contiguous against ~21,320 needed. That is genuine fragmentation, so find out what else is in the heap at that moment — either instrument the failure with the block layout, or give the payload a fixed boot-reserved buffer so each fetch stops carving a new hole.
+6. **Re-open the arena only if 4 and 5 fail**, sized by those numbers. It was parked for starving the *receive* path, so any give/take design has to leave a fetch its 6–8 KB.
+7. **Treat the payload ceiling as a last resort.** Dropping it to ~8 KB shrinks the payload term but refuses more apps, and the server is where oversized assets genuinely belong.
+8. **Measure the gfx task's stack watermark on a *successful* decode.** It was trimmed to 4,608 on a reading taken while decodes were failing, which understates the real peak. If it is tight, that shows up as a reset, and you are back in §7.
+9. **Keep the ELF before every flash.**
 
 ---
 
@@ -164,6 +166,7 @@ It is kept in `gfx.c` behind `GFX_DECODE_ARENA_ENABLED 0` with the full reasonin
 8. **gpio0 is both the download strap and the button.** Keep that in mind before wiring anything to it.
 9. **`idf.py flash` rebuilds.** See §2 — it silently invalidates a preserved ELF.
 10. **libwebp's `MODE_RGB_565` output is not a native `uint16_t`.** `WEBP_SWAP_16BIT_CSP` defaults to 0, so both the lossy (`VP8YuvToRgb565`) and lossless (`VP8LConvertBGRAToRGB565_C`) paths write two bytes per pixel as `[rg][gb]`: byte 0 is red in bits 7..3 plus the top three bits of green, byte 1 is the rest of green plus blue. Reading the pair as a `uint16_t` on this little-endian part transposes the channels — it shows up as **near-white pixels turning blue or green**, while pure white and black survive, because the error cancels when both bytes are equal. `rgb_to_565()`/`rgb_from_565()` in `display.h` are the only place that layout is expressed; do not reimplement it inline. `tools/webp-host-harness/rgb565_check` proves it against an RGBA decode (byte-wise: exact, worst error 5; word-wise: wrong on 306 of 2061 opaque pixels of a real asset).
+11. **The panel colour depth is a compile-time contract, not a run-time knob.** `PIXEL_COLOR_DEPTH_BITS` — 8 in this build — selects the CIE table *and*, through `updateMatrixDMABuffer`, the bits read back out of it: it takes the **low** `depth` bits, which is only right if the table's output range matches. Pass any run-time depth below 8 and every channel becomes a sawtooth, each wrapping at a different point, so a pixel's channels reorder. Reported from the panel as brown rendering pink and blue rendering green. The depth was trimmed 8 → 6 → 5 for memory and **all of it was colour-broken**; 6 merely failed less often, because the sawtooth period is longer. Keep `kPanelColorDepthBits` at 8, or rebuild the library with a matching define (`cie_luts.h` has native tables for 4/6/7/8/10/12 only — and its 5-bit fallback path is dead code, because the .cpp tests `#ifdef LUT_NATIVE_BIT_DEPTH` rather than its value). `tools/webp-host-harness/depth_sim` prints the mapping: at depth 5, input 200 mapped to 82 while input 139 mapped to 205.
 
 ---
 

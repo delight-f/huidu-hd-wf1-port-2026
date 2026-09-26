@@ -3,12 +3,14 @@
 # decoder can be measured and its output inspected on a workstation instead of
 # by flashing the board.
 #
-#   ./build.sh          -> ./measure, ./render and ./rgb565_check
+#   ./build.sh          -> ./measure, ./render, ./rgb565_check and ./depth_sim
 #   ./measure FILE...   decode peak transient heap per frame, under several
 #                       decoder options
 #   ./render FILE TAG   write render_TAG_{ref,naive,offset,scratch}.ppm montages
 #                       (ref = libwebp's own WebPAnimDecoder)
 #   ./rgb565_check FILE prove the MODE_RGB_565 byte layout against an RGBA decode
+#   ./depth_sim FILE    show what the HUB75 driver's CIE table + low-bit read does
+#                       to a colour at each panel colour depth (see depth_sim.c)
 #
 # __SSE2__ is undefined for the host build on purpose: the ESP-IDF component
 # compiles libwebp without SIMD, and the _sse2.c files are not in the source
@@ -17,6 +19,7 @@ set -e
 cd "$(dirname "$0")"
 
 LW=../../managed_components/libwebp
+LUT=../../managed_components/esp32-hub75-matrixpanel-dma/src
 if [ ! -d "$LW/src" ]; then
   echo "vendored libwebp not found at $LW/src" >&2
   echo "run 'idf.py build' once so the component manager fetches it" >&2
@@ -42,8 +45,10 @@ cc $CFLAGS -o measure measure.c memtrack.c $SRC -lm \
   -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free
 cc $CFLAGS -o render render.c $SRC -lm
 cc $CFLAGS -o rgb565_check rgb565_check.c $SRC -lm
+# depth_sim needs the hub75 driver's CIE tables, not libwebp's.
+cc $CFLAGS -I "$LUT" -o depth_sim depth_sim.c lut6.c $SRC -lm
 
-echo "built: ./measure ./render ./rgb565_check"
+echo "built: ./measure ./render ./rgb565_check ./depth_sim"
 echo
 echo "sample assets to try:"
 echo "  components/assets/tronbyt.webp      (360 frames, lossless)"

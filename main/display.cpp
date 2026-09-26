@@ -304,19 +304,41 @@ int display_initialize(void) {
            "double_buff=%d",
            drv, line, spd, latch, ph, dbfr);
 
-  // Panel colour depth, in bits per channel. The driver's framebuffer is one
-  // uint16_t per pixel per bit per row, so every bit costs ~2 KB of internal
-  // DMA-capable RAM - the same pool libwebp's internal decode buffer has to come
-  // from. This is a memory knob set by arithmetic, not by taste: the simultaneous
-  // demand at decode time (payload + decoder + canvas + scratch) does not fit at
-  // 8, and what fails first is compositing and then the later frames of an
-  // animation, both of which show up as wrong pixels rather than as an error.
+  // Panel colour depth, in bits per channel.
   //
-  // Note this also shifts the BCM bitplane timing (nsPerRow scales with depth), so
-  // it is a panel-behaviour change, not only a size change - judge it on the panel,
-  // and remember the panel shows collapsed rows after a flash until it has been
-  // power-cycled (HANDOFF.md).
-  constexpr uint8_t kPanelColorDepthBits = 5;
+  // THIS MUST STAY 8 unless the library is rebuilt to match. The driver picks its
+  // CIE correction table at COMPILE time from PIXEL_COLOR_DEPTH_BITS - which this
+  // build defines as 8 - and then reduces a colour by reading its LOW depth bits:
+  //
+  //     red_val = lumConvTab[red];                  // 0..255, chosen at build time
+  //     for (i = depth-1; i >= 0; i--)              // masks 1<<(depth-1) .. 1<<0
+  //       bitplane[i] = (red_val & (1 << i)) ? 1 : 0;
+  //
+  // That is only correct when the run-time depth equals the build-time macro,
+  // because that is what makes the table's output range match the bits read. Set
+  // it lower and the driver takes the low bits of an 8-bit value instead of the
+  // high ones, which is a sawtooth per channel rather than a scale: each channel
+  // wraps at a different point, so a pixel's channels come out reordered.
+  //
+  // Measured on the host with the depth at 5 - input 200 mapped to 82 while input
+  // 139 mapped to 205 - and on the panel as brown rendering pink and blue
+  // rendering green. The depth was trimmed 8 -> 6 -> 5 to buy memory and every
+  // step of it was colour-broken; 6 was merely less so, because the sawtooth
+  // period is longer. tools/webp-host-harness/depth_sim reproduces the table.
+  //
+  // Depth 8 is the only correct value that needs no build-time change, and it is
+  // upstream's default, so it is also the value that does not risk other boards.
+  // Each bit costs ~2 KB of internal DMA-capable RAM (64x32 = 2,048 B per bit) -
+  // the same pool libwebp's decode buffer comes from - and the retained-image
+  // release in gfx.c has since returned far more than that. Going lower is only
+  // valid by rebuilding the library with a matching PIXEL_COLOR_DEPTH_BITS, which
+  // is worth ~2 KB at depth 6 and needs that define injected into the managed
+  // component.
+  //
+  // It also sets the BCM bitplane timing (nsPerRow scales with depth), and the
+  // panel shows collapsed rows after a flash until it has been power-cycled
+  // (HANDOFF.md).
+  constexpr uint8_t kPanelColorDepthBits = 8;
 
   HUB75_I2S_CFG mxconfig(
       WIDTH, HEIGHT, 1, pins,
