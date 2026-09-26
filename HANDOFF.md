@@ -103,7 +103,9 @@ cp build/firmware.elf artifacts/$(date +%Y%m%d)-<what>.elf
 - **It is still not enough, and now the reason is specific.** At decode time the heap shows 33–42 KB *free* but only **14,336–18,432 B contiguous**, because `gfx.c` deliberately **keeps the previous image resident so its animation can loop** (*"keep webp around to loop until the next image arrives"*, `gfx_loop()`) while `main.c` receives the next payload. libwebp wants ~21.3 KB contiguous. So `frame 2 decode failed (out of memory)` persists for the ~13 KB app, and the compositing gate — which needs 38,912 B free — is still refused at 32,916–37,656.
 - **Fixed by removing the coexistence, not by finding more bytes.** `gfx_shed_retained()` (called by the main loop just before each fetch) asks the gfx task to drop the displayed image and cut its current pass short; the task frees it at the top of its loop and sets `s_shed_done`, and `gfx_queue()` clears the request when the next image arrives. The wait is bounded (~1 s), so a mid-frame shed degrades to the previous behaviour rather than stalling the display.
 - **Why that is safe — the thing to hold on to:** the **HUB75 driver keeps its own framebuffer**, and the matrix is refreshed from that framebuffer by DMA, not from anything the application holds. Once a frame has been pushed, the compressed WebP is dead weight. So the panel simply holds its last drawn frame for the length of a fetch (tens to a few hundred ms) and resumes when the next image is queued. It also explains why the arena in §5 was never needed: the memory that had to be given back was already unreferenced.
-- **Not yet verified on hardware.** Both this and the 565 fix were built after the last flash. Watch `largest_internal` at decode time — it has to clear ~21,320 — and check that the ~13 KB animated app decodes all of its frames.
+- **Verified on device after flashing this and the 565 fix.** The shed fires on every fetch — 28 releases in a 3.5-minute window — and **`frame 2 decode failed` is gone**, though it had been the dominant failure. All 24 samples in that window showed `reset_reason=1`. `largest_internal` now mostly sits at 38,912–47,104 instead of 14,336–18,432.
+- **Two residuals, both about contiguous size rather than free size.** (1) The compositing gate still refuses from time to time — `only 38472 bytes free` against its 38,912 threshold, a 440-byte miss — because it tests *total free* when the real requirement is *one big run*. (2) One decode still failed frame 1: `frame 1 decode failed (out of memory), free 41308 largest 19456`. Plenty free, not enough contiguous, against libwebp's ~21,320.
+- **The gate is the cheap fix and the honest one.** Allocate the scratch first, then require `heap_caps_get_largest_free_block()` to clear ~22 KB — just over the measured 21,320 — and give the scratch back if it does not. That gates on the number that actually predicts a decode instead of a proxy for it, and it is the same lesson this port keeps relearning. The frame-1 residual is a separate, harder problem: genuine fragmentation, not the gate.
 
 ---
 
@@ -140,11 +142,13 @@ It is kept in `gfx.c` behind `GFX_DECODE_ARENA_ENABLED 0` with the full reasonin
 ## 6. What I would do next, in order
 
 1. **The trims landed — confirmed on device.** Boot heap after `ap_start` is 56,216 / 47,104, and the board is stable across minutes. See §3.
-2. **Flash and verify the two fixes that are built but not yet on the board** — the retained-image shed and the RGB565 byte order. Check three things: a ~13 KB animated app decodes **all** its frames (no `frame 2 decode failed`); `largest_internal` at decode time clears ~21,320; and the panel shows true colours, judged against something known-white.
-3. **Only then re-open the arena**, sized by the numbers above. Remember it was parked for starving the *receive* path, so any give/take design has to leave a fetch its 6–8 KB.
-4. **Treat the payload ceiling as a last resort.** Dropping it to ~8 KB shrinks the payload term but refuses more apps, and the server is where oversized assets genuinely belong.
-5. **Measure the gfx task's stack watermark on a *successful* decode.** It was trimmed to 4,608 on a reading taken while decodes were failing, which understates the real peak. If it is tight, that shows up as a reset, and you are back in §7.
-6. **Keep the ELF before every flash.**
+2. **Done — the retained-image shed and the 565 fix are on the board and verified** (§3). Frame-2 failures are gone and 24/24 samples were stable.
+3. **Gate compositing on the largest free block rather than on total free.** Allocate the scratch, then require `heap_caps_get_largest_free_block()` to clear ~22 KB, and hand the scratch back if it does not (§3, last bullet). Cheapest remaining win, and it removes the `only … bytes free` refusals that still leave some animation frames unblended.
+4. **Then attack the frame-1 residual.** One decode still fails with 41 KB free but only 19,456 contiguous against ~21,320 needed. That is genuine fragmentation, so find out what else is in the heap at that moment — either instrument the failure with the block layout, or give the payload a fixed boot-reserved buffer so each fetch stops carving a new hole.
+5. **Re-open the arena only if 3 and 4 fail**, sized by those numbers. It was parked for starving the *receive* path, so any give/take design has to leave a fetch its 6–8 KB.
+6. **Treat the payload ceiling as a last resort.** Dropping it to ~8 KB shrinks the payload term but refuses more apps, and the server is where oversized assets genuinely belong.
+7. **Measure the gfx task's stack watermark on a *successful* decode.** It was trimmed to 4,608 on a reading taken while decodes were failing, which understates the real peak. If it is tight, that shows up as a reset, and you are back in §7.
+8. **Keep the ELF before every flash.**
 
 ---
 
