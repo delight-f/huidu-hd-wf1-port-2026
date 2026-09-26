@@ -823,44 +823,62 @@ static esp_err_t save_handler(httpd_req_t *req) {
   bool skip_display_version = false;
   bool skip_boot_animation = false;
 
-  // Use httpd_query_key_value to parse form data
-  if (httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid)) != ESP_OK) {
+  // Use httpd_query_key_value to parse form data. Each field records whether it
+  // was present at all, because the setters below must leave an omitted field
+  // alone rather than reset it - see the note there.
+  const bool have_ssid =
+      httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid)) == ESP_OK;
+  if (!have_ssid) {
     ESP_LOGD(TAG, "SSID param missing");
   }
 
-  if (httpd_query_key_value(buf, "password", password, sizeof(password)) !=
-      ESP_OK) {
+  const bool have_password =
+      httpd_query_key_value(buf, "password", password, sizeof(password)) ==
+      ESP_OK;
+  if (!have_password) {
     ESP_LOGD(TAG, "Password param missing");
   }
 
-  if (httpd_query_key_value(buf, "image_url", image_url, sizeof(image_url)) !=
-      ESP_OK) {
+  const bool have_image_url =
+      httpd_query_key_value(buf, "image_url", image_url, sizeof(image_url)) ==
+      ESP_OK;
+  if (!have_image_url) {
     ESP_LOGD(TAG, "Image URL param missing");
   }
 
+  bool have_swap_colors = false;
   if (httpd_query_key_value(buf, "swap_colors", swap_val, sizeof(swap_val)) ==
       ESP_OK) {
     swap_colors = (strcmp(swap_val, "1") == 0);
+    have_swap_colors = true;
   }
 
+  bool have_disable_touch = false;
   if (httpd_query_key_value(buf, "disable_touch", touch_val,
                             sizeof(touch_val)) == ESP_OK) {
     disable_touch = (strcmp(touch_val, "1") == 0);
+    have_disable_touch = true;
   }
 
+  bool have_touch_beep = false;
   if (httpd_query_key_value(buf, "touch_beep", touch_beep_val,
                             sizeof(touch_beep_val)) == ESP_OK) {
     touch_beep = (strcmp(touch_beep_val, "1") == 0);
+    have_touch_beep = true;
   }
 
+  bool have_skip_version = false;
   if (httpd_query_key_value(buf, "skip_display_version", skip_version_val,
                             sizeof(skip_version_val)) == ESP_OK) {
     skip_display_version = (strcmp(skip_version_val, "1") == 0);
+    have_skip_version = true;
   }
 
+  bool have_skip_boot = false;
   if (httpd_query_key_value(buf, "skip_boot_animation", skip_boot_val,
                             sizeof(skip_boot_val)) == ESP_OK) {
     skip_boot_animation = (strcmp(skip_boot_val, "1") == 0);
+    have_skip_boot = true;
   }
 
   // Keep the stored value if a client omits the field, rather than resetting.
@@ -886,14 +904,38 @@ static esp_err_t save_handler(httpd_req_t *req) {
            skip_display_version ? "true" : "false",
            skip_boot_animation ? "true" : "false");
 
-  nvs_set_ssid(ssid);
-  nvs_set_password(password);
-  nvs_set_image_url(strlen(image_url) < 6 ? NULL : image_url);
-  nvs_set_swap_colors(swap_colors);
-  nvs_set_disable_touch(disable_touch);
-  nvs_set_touch_beep(touch_beep);
-  nvs_set_skip_display_version(skip_display_version);
-  nvs_set_skip_boot_animation(skip_boot_animation);
+  // Keep the stored value for every field the client did not send.
+  //
+  // This used to be done for color_order alone while the comment above claimed it
+  // for everything, so a POST carrying nothing but image_url silently blanked the
+  // WiFi credentials - and since the stored password cannot be read back, the only
+  // recovery was re-provisioning through the captive portal. Which fields a form
+  // happens to include is not something a client should have to get right in order
+  // to change one setting.
+  if (have_ssid) {
+    nvs_set_ssid(ssid);
+  }
+  if (have_password) {
+    nvs_set_password(password);
+  }
+  if (have_image_url) {
+    nvs_set_image_url(strlen(image_url) < 6 ? NULL : image_url);
+  }
+  if (have_swap_colors) {
+    nvs_set_swap_colors(swap_colors);
+  }
+  if (have_disable_touch) {
+    nvs_set_disable_touch(disable_touch);
+  }
+  if (have_touch_beep) {
+    nvs_set_touch_beep(touch_beep);
+  }
+  if (have_skip_version) {
+    nvs_set_skip_display_version(skip_display_version);
+  }
+  if (have_skip_boot) {
+    nvs_set_skip_boot_animation(skip_boot_animation);
+  }
   nvs_set_color_order(color_order);
   ESP_LOGI(TAG, "Color Order: %s", nvs_color_order_to_string(color_order));
   nvs_save_settings();
