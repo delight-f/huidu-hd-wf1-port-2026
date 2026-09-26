@@ -359,9 +359,9 @@ sdkconfig.defaults.huidu-wf1  the WF1's tunables, each with its measurement
 
 **Verified on hardware:** builds and flashes under ESP-IDF v5.5 for `esp32s2`; boots and pins tasks on the single core; joins WiFi and gets DHCP over IPv4; fetches real images from the Tronbyt server in tens to a few hundred milliseconds (29–326 ms measured); displays stills and animations; serves the config portal, `/diag` and `/panel`; and the decode/compositing logic is byte-identical to libwebp's own animation decoder on the host harness. The memory trims are measured on the board — boot heap after `ap_start` is **56,216 free / 47,104 largest**, up from 41,084 / 32,768 — and hold steady over minutes of operation.
 
-**Verified on hardware since the trims:** the retained-image release — 28 shed releases in a 3.5-minute window, `frame 2 decode failed` eliminated, 24/24 samples stable; the RGB565 byte-order fix; and **compositing made unconditional** by reserving the scratch at boot, which produced **zero** compositing refusals in 3.3 minutes where the previous gate refused about 30, with colours true throughout.
+**Verified on hardware since the trims:** the retained-image release — 28 shed releases in a 3.5-minute window, `frame 2 decode failed` eliminated, 24/24 samples stable; the RGB565 byte-order fix; **compositing made unconditional** by reserving the scratch at boot (zero refusals in 3.3 minutes, where the gate had refused ~30); and **the payload buffer reserved at boot**, which eliminated the failed-render loop entirely — zero decode failures and zero failed draws over 4 minutes on a 12,552-byte image that had been failing 51 times, 60/60 samples stable.
 
-**Open:** two `frame 1 decode failed` remain, at `free 37028 largest 16384` — plenty free, not enough contiguous, at the moment the payload and the scratch coexist. The next move is to give the payload a fixed boot-reserved buffer by the same argument that just worked for the scratch.
+**Open:** the decode margin is now thin. Runtime `largest_internal` sits at 22,528–23,552 against the 21,320 a frame needs, so a hungrier app could still tip it. The honest lever left is asset sizing at the server, or accepting the ceiling as the boundary.
 
 **Open, in priority order:**
 
