@@ -572,11 +572,10 @@ static void gfx_loop(void *args) {
 // predecessors.
 //
 // libwebp needs that set as a single contiguous run: measured at 21,320 bytes for
-// a 64x32 lossless frame, as an 11,816-byte block plus a ~9,504-byte one. So the
-// gate tests the largest free run against this figure, with a little margin,
-// rather than testing total free memory - totals only correlate with it, and
-// three fixes in this port were aimed from totals and all three missed.
-#define GFX_DECODE_MIN_RUN (22 * 1024)
+// a 64x32 lossless frame, as an 11,816-byte block plus a ~9,504-byte one. Nothing
+// tests for it any more - the reservation in gfx_reserve_decode_buffers keeps the
+// heap's shape stable instead, so the run is there when it is needed rather than
+// being guessed at through a threshold.
 
 static uint8_t *s_canvas = NULL;
 static size_t s_canvas_size = 0;
@@ -615,13 +614,36 @@ void gfx_reserve_decode_buffers(void) {
     return;
   }
 
-  const size_t need = (size_t)w * (size_t)h * 2;
+  const size_t canvas_need = (size_t)w * (size_t)h * 2;
   diag_log_heap("canvas reserve: before");
-  if (!grow_buffer(&s_canvas, &s_canvas_size, need)) {
-    ESP_LOGW(TAG, "could not pre-allocate %u-byte canvas", (unsigned)need);
+  if (!grow_buffer(&s_canvas, &s_canvas_size, canvas_need)) {
+    ESP_LOGW(TAG, "could not pre-allocate %u-byte canvas",
+             (unsigned)canvas_need);
     return;
   }
-  ESP_LOGI(TAG, "pre-allocated %u-byte canvas (%dx%d)", (unsigned)need, w, h);
+
+  // The composite scratch is reserved here too, for a subtler reason than the
+  // canvas. The canvas has to be early because otherwise the network stack
+  // fragments the heap before it is asked for. The scratch has to be early because
+  // *it* is what fragments the heap: at 8 KB, allocated per fetch, it lands
+  // wherever there is room and splits the largest free block roughly in half -
+  // measured on this board as a 24,576-byte largest run with it released and
+  // 17,408-26,624 with it held. That is the very block libwebp needs for the next
+  // frame, so holding it was costing the decoder its runway, and every earlier
+  // attempt to decide "is there room to composite" was measuring that instead of
+  // the heap.
+  //
+  // Taken now it comes off a ~139 KB block, before WiFi or the HTTP server have
+  // run, so it costs the run-time heap nothing and leaves compositing
+  // unconditional.
+  const size_t scratch_need = (size_t)w * (size_t)h * 4;
+  if (!grow_buffer(&s_frame, &s_frame_size, scratch_need)) {
+    ESP_LOGW(TAG, "could not pre-allocate %u-byte composite scratch",
+             (unsigned)scratch_need);
+  }
+
+  ESP_LOGI(TAG, "pre-allocated %u-byte canvas and %u-byte scratch (%dx%d)",
+           (unsigned)canvas_need, (unsigned)scratch_need, w, h);
   diag_log_heap("canvas reserve: after");
 }
 
@@ -704,31 +726,6 @@ static void arena_take(void) {
     warned = true;
     ESP_LOGW(TAG, "decode arena lost to another task; decoding without it");
   }
-}
-
-// Release the composite scratch.
-//
-// This buffer is a cache, not a fixture. It is only useful to frame sequences
-// that can afford it, but once allocated it was held for the life of the
-// program - so a single animation early in a session permanently cost 8 KB
-// (w*h*4), to be paid by every still frame and every large frame afterwards.
-// That is the difference between a 31 KB payload decoding and not: with the
-// scratch held, the largest free run sits under the ~12.5 KB libwebp needs,
-// and the on-panel diagnostic reads exactly that ("dec ERR, h20k b11k").
-//
-// Releasing it before a decode that will not composite hands the space to the
-// decoder; a later animation that can afford it simply allocates it again.
-static void release_frame_scratch(void) {
-  if (s_frame == NULL) {
-    return;
-  }
-  ESP_LOGI(TAG, "released %u-byte composite scratch (free %u largest %u)",
-           (unsigned)s_frame_size,
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-  free(s_frame);
-  s_frame = NULL;
-  s_frame_size = 0;
 }
 
 // Names libwebp's failure so the log says which kind of problem it was.
@@ -870,68 +867,41 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
     return 1;
   }
 
-  // Compositing needs an RGBA scratch, so only multi-frame images can want it,
-  // and only when taking it still leaves the decoder room to work. A still
-  // image therefore costs nothing but the canvas.
+  // Compositing is not a decision, and it used to be: this was a gate that took
+  // the RGBA scratch only when the heap looked roomy enough, and drew frames
+  // directly - dropping alpha - when it did not.
   //
-  // The test is on the LARGEST FREE RUN, not on total free memory. Total free is a
-  // proxy for the wrong quantity, and this port has now missed three fixes by
-  // aiming from totals: what decides whether libwebp can decode is one contiguous
-  // ~21,320-byte region. So: take the scratch first, then ask the heap whether the
-  // decoder can still get its run, and hand the scratch straight back if it
-  // cannot. Refusing to composite is not a neutral failure - an unblended partial
-  // frame is exactly what a missing-pixels animation looks like - but engaging
-  // when the decode then fails is worse, because nothing appears at all.
+  // That was the wrong shape of answer twice over. In principle, because the
+  // server serves hundreds of unrelated apps - stills, animations, scrolls, some
+  // far more demanding than others - so any threshold is a threshold that some
+  // app trips, and the ones that trip it render wrong silently and permanently.
+  // And in practice, because it was measuring a self-inflicted wound: the scratch
+  // is 8 KB and, allocated per fetch, it lands wherever it fits, splitting the
+  // 24,576-byte run that the next frame's decode needs (measured: held, the
+  // largest run reads 17,408-26,624; released, 24,576). The run was always big
+  // enough for libwebp. The gate was what made it not be.
+  //
+  // So the scratch is reserved at boot instead (gfx_reserve_decode_buffers), where
+  // it comes off a 139 KB block and costs the run-time heap nothing, and this
+  // normally allocates nothing at all. The only way it can fail now is an image
+  // larger than the panel.
   bool composite = false;
   if (WebPDemuxGetI(demux, WEBP_FF_FRAME_COUNT) > 1) {
-    const size_t free_now = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-    // The largest-free-run measurement below happens AFTER the scratch is
-    // allocated, so the scratch must NOT be added to the requirement again. It
-    // was, briefly, and it made this gate ~8 KB too strict: it demanded 30,720
-    // where the decoder needs 21,320, so compositing was refused with 48 KB free
-    // and frames large enough to decode. That showed up on the panel as
-    // intermittent black pixels - refusing here drops alpha, so a transparent
-    // region renders black instead of showing what is underneath, and the refusal
-    // flipped from redraw to redraw as the largest run crossed the threshold.
-    //
-    // With the arena reserved the decoder takes its run from the arena whatever
-    // this heap looks like, so there is nothing to test and no reason to refuse.
-    const size_t need = s_arena_wanted ? 0 : GFX_DECODE_MIN_RUN;
     if (grow_buffer(&s_frame, &s_frame_size, frame_need)) {
-      const size_t largest =
-          heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-      if (largest >= need) {
-        composite = true;
-      } else {
-        // Capture the block layout once, on the first refusal. That is the
-        // question this gate keeps raising and cannot answer: 48 KB free with a
-        // 17-26 KB largest run means something is splitting the heap, and the
-        // distribution says what. Once only, because the 1 KB log ring cannot
-        // afford a page per refusal.
-        static bool layout_logged = false;
-        if (!layout_logged) {
-          layout_logged = true;
-          diag_dump_heap_layout();
-        }
-        ESP_LOGW(TAG,
-                 "largest free run %u < %u needed (free %u) - drawing frames "
-                 "directly without compositing",
-                 (unsigned)largest, (unsigned)need, (unsigned)free_now);
-      }
+      composite = true;
     } else {
       ESP_LOGW(TAG,
-               "no room for the %u-byte composite scratch (free %u) - drawing "
-               "frames directly without compositing",
-               (unsigned)frame_need, (unsigned)free_now);
+               "no room for the %u-byte composite scratch (free %u largest %u) - "
+               "drawing frames directly without compositing",
+               (unsigned)frame_need,
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
     }
   }
 
-  // Anything that will not composite gives the scratch back before decoding, so
-  // the decoder gets it rather than it idling as a cache. This includes the
-  // still-image path, which never wants the scratch at all.
-  if (!composite) {
-    release_frame_scratch();
-  }
+  // The scratch is deliberately NOT released when compositing is not wanted. It
+  // is a reservation, not a cache: handing it back for the duration of a still
+  // image is exactly the churn that fragments the heap for the next animation.
 
   const int64_t start_us = esp_timer_get_time();
   bool decoded_any = false;
