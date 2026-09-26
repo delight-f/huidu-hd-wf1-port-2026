@@ -18,6 +18,7 @@
 #include "display.h"
 #include "esp_timer.h"
 #include "nvs_settings.h"
+#include "remote.h"
 #include "version.h"
 
 static const char *TAG = "gfx";
@@ -308,7 +309,7 @@ static int gfx_queue(void *webp, size_t len, int32_t dwell_secs,
              "was displayed",
              _state->counter);
     if (!_state->buf_is_static) {
-      free(_state->buf);
+      remote_payload_release(_state->buf);
     }
     _state->buf = NULL;
   }
@@ -466,7 +467,7 @@ static void gfx_loop(void *args) {
     if (pdTRUE != xSemaphoreTake(_state->mutex, portMAX_DELAY)) {
       ESP_LOGE(TAG, "Could not take gfx mutex");
       if (webp && !webp_is_static) {
-        free(webp);
+        remote_payload_release(webp);
         webp = NULL;
       }
       break;
@@ -475,7 +476,7 @@ static void gfx_loop(void *args) {
     // If there's new data, take ownership of buffer
     if (counter != _state->counter) {
       ESP_LOGI(TAG, "Displaying image counter=%d", _state->counter);
-      if (webp && !webp_is_static) free(webp);
+      if (webp && !webp_is_static) remote_payload_release(webp);
       webp = _state->buf;
       webp_is_static = _state->buf_is_static;
       len = _state->len;
@@ -501,7 +502,7 @@ static void gfx_loop(void *args) {
     if (s_shed_wanted && webp != NULL && !webp_is_static) {
       ESP_LOGI(TAG, "released the %u-byte displayed image for the next fetch",
                (unsigned)len);
-      free(webp);
+      remote_payload_release(webp);
       webp = NULL;
       len = 0;
       webp_is_static = false;
@@ -526,7 +527,7 @@ static void gfx_loop(void *args) {
         vTaskDelay(pdMS_TO_TICKS(1 * 1000));
         isAnimating = 0;
         // Free the invalid buffer to prevent re-drawing it
-        if (!webp_is_static) free(webp);
+        if (!webp_is_static) remote_payload_release(webp);
         webp = NULL;
         webp_is_static = false;
         len = 0;

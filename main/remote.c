@@ -20,6 +20,42 @@
 
 static const char* TAG = "remote";
 
+// The reserved payload slot. See remote.h for why it exists.
+//
+// Measured on the board before this: every fetch of a 12,552-byte image pushed the
+// decoder out of house and home - `free 37012 largest 17408`, reproducibly, which
+// is 37 KB free with nothing big enough to decode in. The payload is the last
+// large allocation before the decode and is live for the whole of it, so it sits
+// in the middle of the free space at precisely the wrong moment.
+static uint8_t* s_payload = NULL;
+static size_t s_payload_size = 0;
+static volatile bool s_payload_in_use = false;
+
+void remote_reserve_payload_buffer(void) {
+  const size_t need = CONFIG_HTTP_BUFFER_SIZE_MAX;
+  s_payload = heap_caps_malloc(need, IMAGE_BUF_CAPS);
+  if (s_payload == NULL) {
+    ESP_LOGW(TAG,
+             "could not reserve the %u-byte payload buffer; fetches will "
+             "allocate per request as before",
+             (unsigned)need);
+    return;
+  }
+  s_payload_size = need;
+  ESP_LOGI(TAG, "reserved %u-byte payload buffer", (unsigned)need);
+}
+
+void remote_payload_release(void* buf) {
+  if (buf == NULL) {
+    return;
+  }
+  if (buf == s_payload) {
+    s_payload_in_use = false;
+    return;
+  }
+  free(buf);
+}
+
 struct remote_state {
   void* buf;
   size_t len;
@@ -34,6 +70,7 @@ struct remote_state {
   bool oversize_detected;
   bool connected;  // did the TCP connection to the server ever come up?
   bool buf_lost;   // receive buffer was freed mid-transfer; body is unusable
+  bool reserved;   // buf is the boot reservation, not a per-request allocation
   size_t logged_to;   // progress-log high-water mark, to keep the ring readable
   int64_t started_us; // when perform() began, for per-chunk timing
 };
@@ -103,7 +140,10 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
           // already holding most of the image. Growing here also matters: a
           // shrunk buffer that is left to grow mid-body has to be reached
           // through the very fragmentation this is trying to avoid.
-          if (content_length > 0 && content_length != state->size) {
+          // A reserved buffer is already at the maximum size and must not be
+          // moved, so this right-sizing is for the ad-hoc path only.
+          if (!state->reserved && content_length > 0 &&
+              content_length != state->size) {
             void* resized =
                 heap_caps_realloc(state->buf, content_length, IMAGE_BUF_CAPS);
             if (resized != NULL) {
@@ -187,7 +227,7 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
           if (gfx_display_asset("oversize") != 0) {
             ESP_LOGE(TAG, "Failed to display oversize graphic");
           }
-          free(state->buf);
+          remote_payload_release(state->buf);
           state->buf = NULL;
           state->oversize_detected = true;
           err = ESP_ERR_NO_MEM;
@@ -216,7 +256,7 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
                    (unsigned)state->size,
                    (unsigned)heap_caps_get_free_size(IMAGE_BUF_CAPS),
                    (unsigned)heap_caps_get_largest_free_block(IMAGE_BUF_CAPS));
-          free(state->buf);
+          remote_payload_release(state->buf);
           state->buf = NULL;
           state->buf_lost = true;
           err = ESP_ERR_NO_MEM;
@@ -304,12 +344,27 @@ int remote_get(const char* url, uint8_t** buf, size_t* len,
                uint8_t* brightness_pct, int32_t* dwell_secs,
                int* return_status_code, char** ota_url, char** image_url,
                bool* reboot_requested) {
+  // Prefer the boot reservation. It is only unavailable if the previously
+  // displayed image is somehow still held - the shed normally has it back well
+  // before we get here - and in that case a per-request allocation is the old
+  // behaviour, which is correct if less kind to the heap.
+  void* recv = NULL;
+  size_t recv_cap = CONFIG_HTTP_BUFFER_SIZE_DEFAULT;
+  const bool reserved = (s_payload != NULL && !s_payload_in_use);
+  if (reserved) {
+    recv = s_payload;
+    recv_cap = s_payload_size;
+    s_payload_in_use = true;
+  } else {
+    recv = heap_caps_malloc(CONFIG_HTTP_BUFFER_SIZE_DEFAULT, IMAGE_BUF_CAPS);
+  }
+
   // State for processing the response
   struct remote_state state = {
-      .buf =
-          heap_caps_malloc(CONFIG_HTTP_BUFFER_SIZE_DEFAULT, IMAGE_BUF_CAPS),
+      .buf = recv,
+      .reserved = reserved,
       .len = 0,
-      .size = CONFIG_HTTP_BUFFER_SIZE_DEFAULT,
+      .size = recv_cap,
       .max = CONFIG_HTTP_BUFFER_SIZE_MAX,
       .brightness = -1,
       .dwell_secs = -1,
@@ -339,7 +394,7 @@ int remote_get(const char* url, uint8_t** buf, size_t* len,
   esp_http_client_handle_t http = esp_http_client_init(&config);
   if (http == NULL) {
     ESP_LOGE(TAG, "HTTP client initialization failed for URL: %s", url);
-    free(state.buf);
+    remote_payload_release(state.buf);
     return 1;
   }
 
@@ -380,7 +435,7 @@ int remote_get(const char* url, uint8_t** buf, size_t* len,
                (unsigned)state.len);
     }
     if (state.buf != NULL) {
-      free(state.buf);
+      remote_payload_release(state.buf);
     }
     if (state.image_url != NULL) {
       free(state.image_url);
@@ -402,7 +457,7 @@ int remote_get(const char* url, uint8_t** buf, size_t* len,
              "Truncated response: got %u of %u bytes - discarding",
              (unsigned)state.len, (unsigned)state.expected);
     if (state.buf != NULL) {
-      free(state.buf);
+      remote_payload_release(state.buf);
     }
     if (state.image_url != NULL) {
       free(state.image_url);
@@ -437,7 +492,7 @@ int remote_get(const char* url, uint8_t** buf, size_t* len,
              "off, discarding",
              (unsigned)state.len, (unsigned)(declared + 8));
     if (state.buf != NULL) {
-      free(state.buf);
+      remote_payload_release(state.buf);
     }
     if (state.image_url != NULL) {
       free(state.image_url);
@@ -453,7 +508,7 @@ int remote_get(const char* url, uint8_t** buf, size_t* len,
   if (state.oversize_detected) {
     ESP_LOGI(TAG, "Request aborted due to oversize content");
     if (state.buf != NULL) {
-      free(state.buf);
+      remote_payload_release(state.buf);
     }
     if (state.ota_url != NULL) {
       free(state.ota_url);
@@ -471,7 +526,7 @@ int remote_get(const char* url, uint8_t** buf, size_t* len,
   if (status_code != 200) {
     ESP_LOGE(TAG, "Server returned HTTP status %d", status_code);
     if (state.buf != NULL) {
-      free(state.buf);
+      remote_payload_release(state.buf);
     }
     if (state.ota_url != NULL) {
       free(state.ota_url);

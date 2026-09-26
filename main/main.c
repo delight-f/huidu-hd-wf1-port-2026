@@ -524,6 +524,14 @@ void app_main(void) {
   // that a mid-heap canvas is quite capable of splitting in two.
   gfx_reserve_decode_buffers();
 
+  // Reserve the receive buffer too. It is live for the whole decode and would
+  // otherwise be placed wherever it fits, in the middle of the free space, at
+  // exactly the moment libwebp needs one contiguous block - measured on this
+  // board as `free 37012 largest 17408` on a 12,552-byte image, which is 37 KB
+  // free and nothing big enough to decode in. Taken here it comes off the same
+  // large block the canvas and scratch come from.
+  remote_reserve_payload_buffer();
+
 #if CONFIG_BUTTON_PIN >= 0
   // Configure button pin as input with pull-up
   gpio_config_t button_config = {.pin_bit_mask = (1ULL << CONFIG_BUTTON_PIN),
