@@ -885,16 +885,34 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
   bool composite = false;
   if (WebPDemuxGetI(demux, WEBP_FF_FRAME_COUNT) > 1) {
     const size_t free_now = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-    // A reserved arena already holds the decoder's runway back, so it is the
-    // decoder's own need that matters there rather than decoder-plus-margin.
-    const size_t need = s_arena_wanted ? GFX_DECODE_MIN_RUN
-                                       : GFX_DECODE_MIN_RUN + frame_need;
+    // The largest-free-run measurement below happens AFTER the scratch is
+    // allocated, so the scratch must NOT be added to the requirement again. It
+    // was, briefly, and it made this gate ~8 KB too strict: it demanded 30,720
+    // where the decoder needs 21,320, so compositing was refused with 48 KB free
+    // and frames large enough to decode. That showed up on the panel as
+    // intermittent black pixels - refusing here drops alpha, so a transparent
+    // region renders black instead of showing what is underneath, and the refusal
+    // flipped from redraw to redraw as the largest run crossed the threshold.
+    //
+    // With the arena reserved the decoder takes its run from the arena whatever
+    // this heap looks like, so there is nothing to test and no reason to refuse.
+    const size_t need = s_arena_wanted ? 0 : GFX_DECODE_MIN_RUN;
     if (grow_buffer(&s_frame, &s_frame_size, frame_need)) {
       const size_t largest =
           heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
       if (largest >= need) {
         composite = true;
       } else {
+        // Capture the block layout once, on the first refusal. That is the
+        // question this gate keeps raising and cannot answer: 48 KB free with a
+        // 17-26 KB largest run means something is splitting the heap, and the
+        // distribution says what. Once only, because the 1 KB log ring cannot
+        // afford a page per refusal.
+        static bool layout_logged = false;
+        if (!layout_logged) {
+          layout_logged = true;
+          diag_dump_heap_layout();
+        }
         ESP_LOGW(TAG,
                  "largest free run %u < %u needed (free %u) - drawing frames "
                  "directly without compositing",
