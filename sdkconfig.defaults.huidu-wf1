@@ -56,13 +56,33 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 # fragment the heap, so a large transfer never needs an allocation to make
 # progress. Static buffers are allocated once at WiFi init, while the heap is
 # still one piece.
+# Left at 10 deliberately. Trimming this to 8 was tried, on the reasoning that the
+# largest send on this board is a few hundred bytes and that TX is the safer end to
+# trim than RX. Both halves of that were wrong: the stall came straight back, and
+# worse - 10 `Short payload: holding 1225 of 4082 bytes` and 16 fetches timing out
+# at 30 s in a two-minute window, against 2 and 1 with this at 10 and RX at 12.
+#
+# The reason is that ACKs go out through the TX path, so transmit buffers bound the
+# *receive* window: starve them and the sender stalls one window in, which is the
+# 1,225 bytes above. Treat both RX and TX counts as part of the transport, not as
+# memory knobs, and measure the stall rate either side of any change to them.
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=10
-# 12 -> 10, to hand two ~1.6 KB buffers back to the heap the decoder wants. The
-# over-trimming that broke the transport was down at 6, and the receive ceiling is
-# now 16,384, so the largest body this board will ever accept is ~16 KB rather than
-# the 22 KB that failed back then. Measure fetch latency either side of any further
-# cut: this is the setting that has already broken once.
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+# Reverted to 12. It had been trimmed to 10 to hand two buffers back to the heap
+# the decoder wants, and that was justified by the 16,384-byte receive ceiling -
+# which reasons about body *size* and says nothing about *rate*.
+#
+# The current server exposes the difference. It uses chunked transfer-encoding
+# where the previous one sent Content-Length, and against it about a third of
+# fetches stall after exactly 1,225 bytes and then sit until the 30 s timeout:
+# `Short payload: holding 1225 of 4538 bytes` followed by `HTTP fetch returned in
+# 30156 ms`. 1,225 bytes is one TCP window's worth and the same 1,226-byte figure
+# this file already records from the TCP_WND experiment, so the receiver - not the
+# sender, which answers in 6 ms - is where it stops. Fewer RX buffers means less
+# burst absorbed before the stall.
+#
+# Treat 12 as the known-good floor. Measure both fetch latency and the stall rate
+# before going below it again.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=12
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16
 # A-MPDU stays off: it buys nothing for one HTTP fetch and costs block-ack window

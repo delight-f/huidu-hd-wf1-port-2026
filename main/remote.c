@@ -31,8 +31,18 @@ static uint8_t* s_payload = NULL;
 static size_t s_payload_size = 0;
 static volatile bool s_payload_in_use = false;
 
+// Sized to what the server actually sends, not to the ceiling.
+//
+// The current server's bodies measure 2,290-4,538 bytes, so 6 KB covers every one
+// of them, and every KB not held here is a KB of *contiguous* heap the decoder can
+// use - which is the constrained quantity on this board, not total free. A body
+// larger than this still works: it grows into a fresh buffer and the slot goes
+// straight back to the pool, which is the old behaviour, and correct - just less
+// kind to the heap.
+#define REMOTE_PAYLOAD_RESERVE (6 * 1024)
+
 void remote_reserve_payload_buffer(void) {
-  const size_t need = CONFIG_HTTP_BUFFER_SIZE_MAX;
+  const size_t need = REMOTE_PAYLOAD_RESERVE;
   s_payload = heap_caps_malloc(need, IMAGE_BUF_CAPS);
   if (s_payload == NULL) {
     ESP_LOGW(TAG,
@@ -246,9 +256,23 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
           state->size = state->max;
         }
 
-        // And reallocate
-        void* new =
-            heap_caps_realloc(state->buf, state->size, IMAGE_BUF_CAPS);
+        // And grow. A reserved buffer is not reallocated: moving it would give up
+        // the one property that makes it worth having, which is that the boot heap
+        // put it somewhere that does not split the decoder's runway. So a body
+        // bigger than the reservation grows into a fresh buffer, carrying over
+        // what has arrived, and the slot goes back to the pool for the next small
+        // body. That is the old per-request behaviour, for the rare large body
+        // only. The release happens after the allocation succeeds, so a failure
+        // leaves the reservation intact rather than losing both.
+        void* new = NULL;
+        if (state->reserved) {
+          new = heap_caps_malloc(state->size, IMAGE_BUF_CAPS);
+          if (new != NULL) {
+            memcpy(new, state->buf, state->len);
+          }
+        } else {
+          new = heap_caps_realloc(state->buf, state->size, IMAGE_BUF_CAPS);
+        }
         if (new == NULL) {
           ESP_LOGE(TAG,
                    "Resizing response buffer to %u bytes failed (free %u "
@@ -261,6 +285,14 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
           state->buf_lost = true;
           err = ESP_ERR_NO_MEM;
           break;
+        }
+        if (state->reserved) {
+          ESP_LOGI(TAG,
+                   "body outgrew the %u-byte reservation; growing to %u bytes "
+                   "outside it",
+                   (unsigned)s_payload_size, (unsigned)state->size);
+          remote_payload_release(state->buf);
+          state->reserved = false;
         }
         state->buf = new;
       }

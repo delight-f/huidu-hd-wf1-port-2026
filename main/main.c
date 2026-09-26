@@ -1008,6 +1008,7 @@ void app_main(void) {
         ESP_LOGI(TAG, "Queuing new webp (%d bytes)", len);
 
         const int64_t display_start_us = esp_timer_get_time();
+        const int failures_before = gfx_draw_failures();
         int queued_counter = gfx_update(webp, len, app_dwell_secs);
         // Do not free(webp) here; ownership is transferred to gfx
         webp = NULL;
@@ -1054,7 +1055,16 @@ void app_main(void) {
         // the full time on screen.
         const int64_t dwell_us = (int64_t)app_dwell_secs * 1000000;
         const int64_t shown_us = esp_timer_get_time() - display_start_us;
-        if (shown_us < dwell_us) {
+        if (gfx_draw_failures() != failures_before) {
+          // The draw failed, so the panel is still showing the previous frame -
+          // there is nothing on screen to hold. Waiting out the dwell here is
+          // exactly what made a decode failure look like a hang: the server asks
+          // for a 15 s dwell, so the panel sat frozen for 15 s per attempt, and a
+          // few failures in a row read as a device stuck on the boot animation.
+          // Retry soon instead and let the next fetch have a go.
+          ESP_LOGW(TAG, "draw failed - retrying without waiting out the dwell");
+          vTaskDelay(pdMS_TO_TICKS(500));
+        } else if (shown_us < dwell_us) {
           vTaskDelay(pdMS_TO_TICKS((uint32_t)((dwell_us - shown_us) / 1000)));
         }
 

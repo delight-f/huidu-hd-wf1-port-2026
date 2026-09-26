@@ -60,6 +60,12 @@ static struct gfx_state *_state = NULL;
 static volatile bool s_shed_wanted = false;
 static volatile bool s_shed_done = true;
 
+// Monotonic count of draws that failed. The main loop snapshots it around a
+// queue-and-wait and, if it moved, knows not to hold the panel for the dwell -
+// see the note there. A counter rather than a flag so a caller can never miss a
+// failure or mistake an old one for its own.
+static volatile int s_draw_failures = 0;
+
 static void gfx_loop(void *arg);
 static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
                      volatile int32_t *isAnimating);
@@ -351,6 +357,10 @@ static int gfx_queue(void *webp, size_t len, int32_t dwell_secs,
                    // to be loaded
 }
 
+int gfx_draw_failures(void) {
+  return s_draw_failures;
+}
+
 int gfx_get_loaded_counter(void) {
   if (!_state) return -1;
 
@@ -521,6 +531,7 @@ static void gfx_loop(void *args) {
     if (webp && len > 0) {
       if (draw_webp(webp, len, dwell_secs, &isAnimating)) {
         ESP_LOGE(TAG, "Could not draw webp");
+        s_draw_failures++;
         draw_error_indicator_pixel();
         // draw_webp() already left its stage ("new"/"info") on the panel; do not
         // overwrite it here or we lose which stage failed.
